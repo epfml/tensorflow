@@ -25,6 +25,8 @@ limitations under the License.
 #include <string>
 #include <unordered_set>
 
+#include <iostream>
+
 #include "third_party/eigen3/unsupported/Eigen/CXX11/Tensor"
 #include "tensorflow/core/framework/device_base.h"
 #include "tensorflow/core/framework/kernel_def_builder.h"
@@ -346,6 +348,7 @@ class ModelWeights {
       dense_weights_[j].UpdateDenseDeltaWeights(
           device, *example.dense_vectors_[j], normalized_bounded_dual_delta);
     }
+    // printf("%i, %i\n", sparse_weights_.size(), dense_weights.size());
   }
 
   Status Initialize(OpKernelContext* const context) {
@@ -914,6 +917,8 @@ struct ComputeOptions {
   Regularizations regularizations;
 };
 
+///////////////////////////////////////////////////////////////////////////////////////////////////
+
 // TODO(shengx): The helper classes/methods are changed to support multiclass
 // SDCA, which lead to changes within this function. Need to revisit the
 // convergence once the multiclass SDCA is in.
@@ -928,9 +933,12 @@ void DoCompute(const ComputeOptions& options, OpKernelContext* const context) {
                           options.num_sparse_features_with_values,
                           options.num_dense_features));
 
+  printf("number of sparse features = %i, dense = %i\n", options.num_sparse_features, options.num_dense_features);
+
   const Tensor* example_state_data_t;
   OP_REQUIRES_OK(context,
                  context->input("example_state_data", &example_state_data_t));
+
   TensorShape expected_example_state_shape({examples.num_examples(), 4});
   OP_REQUIRES(context,
               example_state_data_t->shape() == expected_example_state_shape,
@@ -943,6 +951,11 @@ void DoCompute(const ComputeOptions& options, OpKernelContext* const context) {
   auto example_state_data = mutable_example_state_data_t.matrix<float>();
   context->set_output("out_example_state_data", mutable_example_state_data_t);
 
+  // My test functions
+  Tensor my_tensor(DT_FLOAT, TensorShape({1, 2}));
+  auto my_tensor_data = my_tensor.matrix<float>();
+  context->set_output("out_test", my_tensor);
+
   if (options.adaptative) {
     OP_REQUIRES_OK(
         context, examples.SampleAdaptativeProbabilities(
@@ -953,16 +966,24 @@ void DoCompute(const ComputeOptions& options, OpKernelContext* const context) {
   mutex mu;
   Status train_step_status GUARDED_BY(mu);
   std::atomic<std::int64_t> atomic_index(-1);
+
+  // The function train_step is not executed until shard
   auto train_step = [&](const int64 begin, const int64 end) {
     // The static_cast here is safe since begin and end can be at most
     // num_examples which is an int.
     for (int id = static_cast<int>(begin); id < end; ++id) {
+      // Randomly select an index of example
       const int64 example_index =
           examples.sampled_index(++atomic_index, options.adaptative);
+
       const Example& example = examples.example(example_index);
+
+      // Get current dual and example
       const float dual = example_state_data(example_index, 0);
       const float example_weight = example.example_weight();
+
       float example_label = example.example_label();
+
       const Status conversion_status =
           options.loss_updater->ConvertLabel(&example_label);
       if (!conversion_status.ok()) {
@@ -984,11 +1005,12 @@ void DoCompute(const ComputeOptions& options, OpKernelContext* const context) {
       const double new_dual = options.loss_updater->ComputeUpdatedDual(
           options.num_loss_partitions, example_label, example_weight, dual,
           example_statistics.wx[0], example_statistics.normalized_squared_norm);
-
+      
       // Compute new weights.
       const double normalized_bounded_dual_delta =
           (new_dual - dual) * example_weight /
           options.regularizations.symmetric_l2();
+
       model_weights.UpdateDeltaWeights(
           context->eigen_cpu_device(), example,
           std::vector<double>{normalized_bounded_dual_delta});
@@ -1002,6 +1024,14 @@ void DoCompute(const ComputeOptions& options, OpKernelContext* const context) {
           options.loss_updater->ComputeDualLoss(dual, example_label,
                                                 example_weight);
       example_state_data(example_index, 3) = example_weight;
+
+      // test 
+      printf("index = %3i, old_dual = %6f, old_prim = %6f, old_duall= %6f\n",
+             example_index, dual, example_state_data(example_index, 1), example_state_data(example_index, 2));
+      printf("             label    = %6f, ex_weight= %6f, nb_duald = %6f\n",
+             example_label, example_weight, normalized_bounded_dual_delta);
+      printf("             new_dual = %6f, prev_wx  = %6f, wx       = %6f\n",
+             new_dual, example_statistics.prev_wx[0], example_statistics.wx[0]);   
     }
   };
   // TODO(sibyl-Aix6ihai): Tune this properly based on sparsity of the data,
@@ -1010,10 +1040,134 @@ void DoCompute(const ComputeOptions& options, OpKernelContext* const context) {
   const DeviceBase::CpuWorkerThreads& worker_threads =
       *context->device()->tensorflow_cpu_worker_threads();
 
+  printf("Before shard\n");
+  printf("index = %3i, primalLoss = %4f, dualloss       = %f\n", 0,example_state_data(0, 1), 
+              example_state_data(0, 2));
+
+  printf("index = %3i, primalLoss = %4f, dualloss       = %f\n", 1,example_state_data(1, 1), 
+              example_state_data(1, 2));
+
   Shard(worker_threads.num_threads, worker_threads.workers,
         examples.num_examples(), kCostPerUnit, train_step);
+
+  printf("After shard\n");
+  printf("index = %3i, primalLoss = %4f, dualloss       = %f\n", 0,example_state_data(0, 1), 
+              example_state_data(0, 2));
+
+  printf("index = %3i, primalLoss = %4f, dualloss       = %f\n", 1,example_state_data(1, 1), 
+              example_state_data(1, 2));
+
   OP_REQUIRES_OK(context, train_step_status);
 }
+
+///////////////////////////////////////////////////////////////////////////////////////////////////
+
+
+// // TODO(shengx): The helper classes/methods are changed to support multiclass
+// // SDCA, which lead to changes within this function. Need to revisit the
+// // convergence once the multiclass SDCA is in.
+// void DoCompute(const ComputeOptions& options, OpKernelContext* const context) {
+//   ModelWeights model_weights;
+//   OP_REQUIRES_OK(context, model_weights.Initialize(context));
+
+//   Examples examples;
+//   OP_REQUIRES_OK(
+//       context,
+//       examples.Initialize(context, model_weights, options.num_sparse_features,
+//                           options.num_sparse_features_with_values,
+//                           options.num_dense_features));
+
+//   const Tensor* example_state_data_t;
+//   OP_REQUIRES_OK(context,
+//                  context->input("example_state_data", &example_state_data_t));
+//   TensorShape expected_example_state_shape({examples.num_examples(), 4});
+//   OP_REQUIRES(context,
+//               example_state_data_t->shape() == expected_example_state_shape,
+//               errors::InvalidArgument(
+//                   "Expected shape ", expected_example_state_shape.DebugString(),
+//                   " for example_state_data, got ",
+//                   example_state_data_t->shape().DebugString()));
+
+//   Tensor mutable_example_state_data_t(*example_state_data_t);
+//   auto example_state_data = mutable_example_state_data_t.matrix<float>();
+//   context->set_output("out_example_state_data", mutable_example_state_data_t);
+
+//   // My test functions
+//   Tensor my_tensor(DT_FLOAT, TensorShape({1, 2}));
+//   auto my_tensor_data = my_tensor.matrix<float>();
+//   context->set_output("out_test", my_tensor);
+
+//   if (options.adaptative) {
+//     OP_REQUIRES_OK(
+//         context, examples.SampleAdaptativeProbabilities(
+//                      options.num_loss_partitions, options.regularizations,
+//                      model_weights, example_state_data, options.loss_updater));
+//   }
+
+//   mutex mu;
+//   Status train_step_status GUARDED_BY(mu);
+//   std::atomic<std::int64_t> atomic_index(-1);
+//   auto train_step = [&](const int64 begin, const int64 end) {
+//     // The static_cast here is safe since begin and end can be at most
+//     // num_examples which is an int.
+//     for (int id = static_cast<int>(begin); id < end; ++id) {
+//       const int64 example_index =
+//           examples.sampled_index(++atomic_index, options.adaptative);
+//       const Example& example = examples.example(example_index);
+//       const float dual = example_state_data(example_index, 0);
+//       const float example_weight = example.example_weight();
+//       float example_label = example.example_label();
+//       const Status conversion_status =
+//           options.loss_updater->ConvertLabel(&example_label);
+//       if (!conversion_status.ok()) {
+//         mutex_lock l(mu);
+//         train_step_status = conversion_status;
+//         // Return from this worker thread - the calling thread is
+//         // responsible for checking context status and returning on error.
+//         return;
+//       }
+
+//       // Compute wx, example norm weighted by regularization, dual loss,
+//       // primal loss.
+//       // For binary SDCA, num_weight_vectors should be one.
+//       const ExampleStatistics example_statistics =
+//           example.ComputeWxAndWeightedExampleNorm(
+//               options.num_loss_partitions, model_weights,
+//               options.regularizations, 1 /* num_weight_vectors */);
+
+//       const double new_dual = options.loss_updater->ComputeUpdatedDual(
+//           options.num_loss_partitions, example_label, example_weight, dual,
+//           example_statistics.wx[0], example_statistics.normalized_squared_norm);
+      
+//       // Compute new weights.
+//       const double normalized_bounded_dual_delta =
+//           (new_dual - dual) * example_weight /
+//           options.regularizations.symmetric_l2();
+//       model_weights.UpdateDeltaWeights(
+//           context->eigen_cpu_device(), example,
+//           std::vector<double>{normalized_bounded_dual_delta});
+
+//       // Update example data.
+//       example_state_data(example_index, 0) = new_dual;
+//       example_state_data(example_index, 1) =
+//           options.loss_updater->ComputePrimalLoss(
+//               example_statistics.prev_wx[0], example_label, example_weight);
+//       example_state_data(example_index, 2) =
+//           options.loss_updater->ComputeDualLoss(dual, example_label,
+//                                                 example_weight);
+//       example_state_data(example_index, 3) = example_weight;
+//     }
+//   };
+//   // TODO(sibyl-Aix6ihai): Tune this properly based on sparsity of the data,
+//   // number of cpus, and cost per example.
+//   const int64 kCostPerUnit = examples.num_features();
+//   const DeviceBase::CpuWorkerThreads& worker_threads =
+//       *context->device()->tensorflow_cpu_worker_threads();
+
+//   Shard(worker_threads.num_threads, worker_threads.workers,
+//         examples.num_examples(), kCostPerUnit, train_step);
+//   OP_REQUIRES_OK(context, train_step_status);
+// }
 
 }  // namespace
 

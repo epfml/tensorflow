@@ -69,6 +69,7 @@ class SDCAOptimizer(object):
     self._num_table_shards = num_table_shards
     self._symmetric_l1_regularization = symmetric_l1_regularization
     self._symmetric_l2_regularization = symmetric_l2_regularization
+    print("sdca_ops\n")
 
   def get_name(self):
     return 'SDCAOptimizer'
@@ -77,7 +78,7 @@ class SDCAOptimizer(object):
                      weight_column_name, loss_type, features, targets,
                      global_step):
     """Returns the training operation of an SdcaModel optimizer."""
-
+    print("get_train_step\n")
     def _tensor_to_sparse_feature_column(dense_tensor):
       """Returns SparseFeatureColumn for the input dense_tensor."""
       ignore_value = 0.0

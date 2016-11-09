@@ -556,7 +556,7 @@ class SdcaModel(object):
           sparse_weights.append(array_ops.gather(w, sparse_indices[-1]))
 
       # pylint: disable=protected-access
-      esu, sfw, dfw = gen_sdca_ops._sdca_optimizer(
+      esu, sfw, dfw, test = gen_sdca_ops._sdca_optimizer(
           sparse_example_indices,
           sparse_feature_indices,
           sparse_features_values,

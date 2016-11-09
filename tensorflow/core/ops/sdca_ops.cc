@@ -32,6 +32,8 @@ static Status ApplySdcaOptimizerShapeFn(InferenceContext* c) {
   if (c->input("dense_weights", &dense_handles).ok()) {
     c->set_output("out_delta_dense_weights", dense_handles);
   }
+  // set my ops
+  c->set_output("out_test", {c->Matrix(c->MakeDim(1), c->MakeDim(2))});
   return c->set_output(
       "out_example_state_data",
       {c->Matrix(InferenceContext::kUnknownDim, c->MakeDim(4))});
@@ -62,6 +64,7 @@ REGISTER_OP("SdcaOptimizer")
     .Output("out_example_state_data: float")
     .Output("out_delta_sparse_weights: num_sparse_features * float")
     .Output("out_delta_dense_weights: num_dense_features * float")
+    .Output("out_test: float")
     .SetShapeFn(ApplySdcaOptimizerShapeFn)
     .Doc(R"doc(
 Distributed version of Stochastic Dual Coordinate Ascent (SDCA) optimizer for
