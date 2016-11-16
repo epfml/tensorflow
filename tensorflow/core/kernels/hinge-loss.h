@@ -61,7 +61,7 @@ class HingeLossUpdater : public DualLossUpdater {
     }
     return candidate_optimal_dual;
   }
-
+  
   // Conjugate of hinge loss. This is computed as:
   // \phi*(z) = z if z \in [-1, 0] and +infinity everywhere else. See for
   // instance http://www.eecs.berkeley.edu/~wainwrig/stat241b/lec10.pdf

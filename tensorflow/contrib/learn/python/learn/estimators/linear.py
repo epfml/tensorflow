@@ -214,8 +214,8 @@ def sdca_model_fn(features, labels, mode, params):
             num_outputs=1,
             scope=scope))
 
-    _add_bias_column(feature_columns, features, bias, labels,
-                     columns_to_variables)
+    #_add_bias_column(feature_columns, features, bias, labels,
+    #                 columns_to_variables)
 
   def _train_op_fn(unused_loss):
     global_step = contrib_variables.get_global_step()
