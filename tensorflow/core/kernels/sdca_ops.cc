@@ -115,6 +115,58 @@ struct ComputeOptions {
   Regularizations regularizations;
 };
 
+// Compute the soft threshold for this function
+double SoftThreshold(const double alpha, const double gamma){
+  double shrink = std::max(std::abs(alpha) - gamma, 0.0);
+  return std::copysign(shrink, alpha);
+}
+
+// See Primal-Dual Rates and Certificates (2016) formula (18)
+//    G(\alpha) = <w, A\alpha> + B[||A^Tw||_\infty-\lambda]_+ + \lambda||\alpha||_1
+// Compute the duality gap for L1_regularized Problem.
+float ComputeL1DualityGap(const ModelWeights& model_weights, const Examples& examples,
+  const ComputeOptions& options){
+
+  // Part: \lambda||\alpha||_1
+  float l1 = options.regularizations.symmetric_l1();
+  float l1_regularized = l1 * model_weights.l1_norm();
+
+  // B = 1/\lambda f(0) = 1/(2\lambda) ||b||_2^2
+  float B = 0;
+  for (int i = 0; i < examples.num_examples(); ++i){
+    B += std::pow(examples.example(i).example_label(), 2);
+  }
+  B = B/(2*l1); 
+
+  // <w, A\alpha>
+  float w_A_alpha = 0;
+  for (size_t i = 0; i < examples.num_examples(); ++i){
+    const ExampleStatistics example_statistics =
+    examples.example(i).ComputeWxAndWeightedExampleNorm(
+        options.num_loss_partitions, model_weights,
+        options.regularizations, 1 /* num_weight_vectors */);
+
+    w_A_alpha += example_statistics.wx[0] * examples.weight(i);
+  }
+
+  float max_At_w = std::numeric_limits<float>::min();
+  for (int i = 0; i < examples.num_features(); ++i){
+    auto Ai = examples.Ai(i);
+    auto w  = examples.WAsCol();
+    Eigen::Tensor<float, 0, Eigen::RowMajor> sn = (Ai * w).sum();
+    max_At_w = std::max(std::abs(sn()), max_At_w);
+  }
+
+  std::cout << "l1_regularized = " << l1_regularized
+            << ", l1 = " << l1
+            << ", B = " << B 
+            << ", w_A_alpha = " << w_A_alpha
+            << ", max_At_w = " << max_At_w
+            << std::endl;
+
+  return w_A_alpha + B * std::max(max_At_w - l1, static_cast<float>(0)) + l1_regularized;
+}
+
 // TODO(shengx): The helper classes/methods are changed to support multiclass
 // SDCA, which lead to changes within this function. Need to revisit the
 // convergence once the multiclass SDCA is in.
@@ -152,6 +204,10 @@ void DoCompute(const ComputeOptions& options, OpKernelContext* const context) {
                        /*num_weight_vectors =*/1));
   }
 
+  examples.InitializeW(options.num_loss_partitions, options.regularizations, 
+                       model_weights);
+
+
   mutex mu;
   Status train_step_status GUARDED_BY(mu);
   std::atomic<std::int64_t> atomic_index(-1);
@@ -159,61 +215,43 @@ void DoCompute(const ComputeOptions& options, OpKernelContext* const context) {
     // The static_cast here is safe since begin and end can be at most
     // num_examples which is an int.
     for (int id = static_cast<int>(begin); id < end; ++id) {
-      const int64 example_index =
-          examples.sampled_index(++atomic_index, options.adaptative);
-      const Example& example = examples.example(example_index);
-      const float dual = example_state_data(example_index, 0);
-      const float example_weight = example.example_weight();
-      float example_label = example.example_label();
-      const Status conversion_status =
-          options.loss_updater->ConvertLabel(&example_label);
-      if (!conversion_status.ok()) {
-        mutex_lock l(mu);
-        train_step_status = conversion_status;
-        // Return from this worker thread - the calling thread is
-        // responsible for checking context status and returning on error.
-        return;
-      }
+      // const Example& example = examples.example(id);
+      float alpha = model_weights.dense_weights()[id].weight();
 
-      // Compute wx, example norm weighted by regularization, dual loss,
-      // primal loss.
-      // For binary SDCA, num_weight_vectors should be one.
-      const ExampleStatistics example_statistics =
-          example.ComputeWxAndWeightedExampleNorm(
-              options.num_loss_partitions, model_weights,
-              options.regularizations, 1 /* num_weight_vectors */);
+      float air = examples.ComputeAiDotR(id);
 
-      const double new_dual = options.loss_updater->ComputeUpdatedDual(
-          options.num_loss_partitions, example_label, example_weight, dual,
-          example_statistics.wx[0], example_statistics.normalized_squared_norm);
+      float ai_squared = examples.ComputeAiSquared(id);
 
-      // Compute new weights.
-      const double normalized_bounded_dual_delta =
-          (new_dual - dual) * example_weight /
-          options.regularizations.symmetric_l2();
+      float candidate = air/ai_squared + alpha;
+      float new_alpha = SoftThreshold(candidate, 
+        options.regularizations.symmetric_l1()/ai_squared);
+
       model_weights.UpdateDeltaWeights(
-          context->eigen_cpu_device(), example,
-          std::vector<double>{normalized_bounded_dual_delta});
+          context->eigen_cpu_device(), new_alpha - alpha, id);
 
-      // Update example data.
-      example_state_data(example_index, 0) = new_dual;
-      example_state_data(example_index, 1) =
-          options.loss_updater->ComputePrimalLoss(
-              example_statistics.prev_wx[0], example_label, example_weight);
-      example_state_data(example_index, 2) =
-          options.loss_updater->ComputeDualLoss(dual, example_label,
-                                                example_weight);
-      example_state_data(example_index, 3) = example_weight;
+      examples.UpdateW(id, new_alpha - alpha);
+
+      std::cout << "\033[1;31mId = " << id 
+          << ", l1 = " << options.regularizations.symmetric_l1()
+          << ", new alpha  = " << new_alpha 
+          << ", alpha      = " << alpha 
+          << ", squared_ai = " << ai_squared
+          << ", air        = " << air
+          << "\033[0m" << std::endl;
     }
   };
+
   // TODO(sibyl-Aix6ihai): Tune this properly based on sparsity of the data,
   // number of cpus, and cost per example.
-  const int64 kCostPerUnit = examples.num_features();
+  const int64 kCostPerUnit = examples.num_examples();
   const DeviceBase::CpuWorkerThreads& worker_threads =
       *context->device()->tensorflow_cpu_worker_threads();
 
   Shard(worker_threads.num_threads, worker_threads.workers,
-        examples.num_examples(), kCostPerUnit, train_step);
+        examples.num_features(), kCostPerUnit, train_step);
+
+  std::cout << "Duality Gap = " << ComputeL1DualityGap(model_weights, examples, options)
+            << std::endl;
   OP_REQUIRES_OK(context, train_step_status);
 }
 

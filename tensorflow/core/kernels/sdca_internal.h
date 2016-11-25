@@ -111,6 +111,7 @@ class Regularizations {
   }
 
   float symmetric_l2() const { return symmetric_l2_; }
+  float symmetric_l1() const { return symmetric_l1_; }
 
  private:
   float symmetric_l1_ = 0;
@@ -123,6 +124,7 @@ class Regularizations {
 };
 
 class ModelWeights;
+class Examples;
 
 // Struct describing a single example.
 class Example {
@@ -162,6 +164,13 @@ class Example {
           data_matrix.dimension(1));
     }
 
+    // Returns a col slice from the matrix.
+    Eigen::TensorMap<Eigen::Tensor<const float, 1, Eigen::RowMajor>> Col()
+        const {
+      return Eigen::TensorMap<Eigen::Tensor<const float, 1, Eigen::RowMajor>>(
+          data_matrix.data(), data_matrix.dimension(0));
+    }
+
     // Returns a row slice as a 1 * F matrix, where F is the number of features.
     Eigen::TensorMap<Eigen::Tensor<const float, 2, Eigen::RowMajor>>
     RowAsMatrix() const {
@@ -173,6 +182,10 @@ class Example {
     const TTypes<float>::ConstMatrix data_matrix;
     const int64 row_index;
   };
+
+  const std::vector<std::unique_ptr<DenseVector> >& dense_vectors() const{
+    return dense_vectors_;
+  }
 
  private:
   std::vector<SparseFeatures> sparse_features_;
@@ -212,12 +225,20 @@ class FeatureWeightsDenseStorage {
   // Delta weights durining mini-batch updates.
   TTypes<float>::Matrix deltas() const { return deltas_; }
 
+  // Get weight
+  float weight() const { return nominals_(0,0) + deltas_(0,0);}
+
   // Updates delta weights based on active dense features in the example and
   // the corresponding dual residual.
   void UpdateDenseDeltaWeights(
       const Eigen::ThreadPoolDevice& device,
       const Example::DenseVector& dense_vector,
       const std::vector<double>& normalized_bounded_dual_delta);
+
+  // Update delta weights using dual alpha
+  void UpdateDenseDeltaWeights(
+    const Eigen::ThreadPoolDevice& device,
+    double delta_alpha);
 
  private:
   // The nominal value of the weight for a feature (indexed by its id).
@@ -294,6 +315,10 @@ class ModelWeights {
       const Eigen::ThreadPoolDevice& device, const Example& example,
       const std::vector<double>& normalized_bounded_dual_delta);
 
+  // Update i-th weight with delta dual weight.
+  void UpdateDeltaWeights(const Eigen::ThreadPoolDevice& device, 
+    const float delta_alpha, int i);
+
   Status Initialize(OpKernelContext* const context);
 
   const std::vector<FeatureWeightsSparseStorage>& sparse_weights() const {
@@ -303,6 +328,8 @@ class ModelWeights {
   const std::vector<FeatureWeightsDenseStorage>& dense_weights() const {
     return dense_weights_;
   }
+
+  float l1_norm() const;
 
  private:
   std::vector<FeatureWeightsSparseStorage> sparse_weights_;
@@ -346,6 +373,32 @@ class Examples {
                     int num_sparse_features_with_values,
                     int num_dense_features);
 
+
+  // Initialize primal weight using formula 
+  //            w = \grad f(A\alpha) = A\alpha - b
+  void InitializeW(const int num_loss_partitions, 
+  const Regularizations& regularization, const ModelWeights& model_weights);
+
+  // Compute the inner product between a column of A and residual R
+  float ComputeAiDotR(int i) const;
+
+  // Compute squared norm of i-th column of A
+  float ComputeAiSquared(int i) const;
+
+  // Update primal weight when dual weight alpha update in i-th direction.
+  void UpdateW(int i, float delta_alpha);
+
+  // Get i-th element of primal weight 
+  float weight(int i) const { return (*w)(i, 0);}
+
+  // Return column representation of primal weight
+  Eigen::TensorMap<Eigen::Tensor<float, 1, Eigen::RowMajor>> WAsCol() const ;
+
+  // Return i-th column of Matrix A
+  Eigen::TensorMap<Eigen::Tensor<const float, 1, Eigen::RowMajor>> Ai(int i) const{
+    return example(0).dense_vectors_[i]->Col();
+  }
+
  private:
   // Reads the input tensors, and builds the internal representation for sparse
   // features per example. This function modifies the |examples| passed in
@@ -376,6 +429,9 @@ class Examples {
 
   // All examples in the batch.
   std::vector<Example> examples_;
+
+  // store primal weight w
+  std::unique_ptr<Eigen::Tensor<float, 2, Eigen::RowMajor> > w;
 
   // Adaptative sampling variables
   std::vector<float> probabilities_;

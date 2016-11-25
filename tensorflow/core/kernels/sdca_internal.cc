@@ -56,6 +56,12 @@ void FeatureWeightsDenseStorage::UpdateDenseDeltaWeights(
   }
 }
 
+void FeatureWeightsDenseStorage::UpdateDenseDeltaWeights(
+    const Eigen::ThreadPoolDevice& device, double delta_alpha){
+  deltas_.device(device) =
+        deltas_ + deltas_.constant(delta_alpha);
+}
+
 void FeatureWeightsSparseStorage::UpdateSparseDeltaWeights(
     const Eigen::ThreadPoolDevice& device,
     const Example::SparseFeatures& sparse_features,
@@ -86,6 +92,19 @@ void ModelWeights::UpdateDeltaWeights(
     dense_weights_[j].UpdateDenseDeltaWeights(
         device, *example.dense_vectors_[j], normalized_bounded_dual_delta);
   }
+}
+
+void ModelWeights::UpdateDeltaWeights(const Eigen::ThreadPoolDevice& device, 
+    const float delta_alpha, int i){
+  dense_weights_[i].UpdateDenseDeltaWeights(device, delta_alpha);
+}
+
+float ModelWeights::l1_norm() const {
+  float sum = 0;
+  for (size_t i = 0; i < dense_weights_.size(); ++i){
+    sum += std::abs(dense_weights_[i].weight());
+  }
+  return sum;
 }
 
 Status ModelWeights::Initialize(OpKernelContext* const context) {
@@ -517,6 +536,41 @@ void Examples::ComputeSquaredNormPerExample(
   const int64 kCostPerUnit = num_dense_features + num_sparse_features;
   Shard(worker_threads.num_threads, worker_threads.workers, num_examples,
         kCostPerUnit, compute_example_norm);
+}
+
+void Examples::InitializeW(const int num_loss_partitions, 
+  const Regularizations& regularization, const ModelWeights& model_weights){
+    for (unsigned int i = 0; i < num_examples(); ++i){
+      const ExampleStatistics example_statistics =
+      examples_[i].ComputeWxAndWeightedExampleNorm(
+          num_loss_partitions, model_weights,
+          regularization, 1 /* num_weight_vectors */);
+
+      float example_label = examples_[i].example_label();
+      (*w)(i, 0) = example_statistics.wx[0] - example_label;
+    }
+}
+
+// Compute inner product of Ai and residual
+float Examples::ComputeAiDotR(int i) const {
+  auto Ai = examples_[0].dense_vectors()[i]->Col();
+  const Eigen::Tensor<float, 0, Eigen::RowMajor> sn = (Ai * WAsCol()).sum();
+  return -sn();
+}
+
+float Examples::ComputeAiSquared(int i) const{
+  auto Ai = examples_[0].dense_vectors()[i]->Col();
+  const Eigen::Tensor<float, 0, Eigen::RowMajor> sn = Ai.square().sum();
+  return sn();
+}
+
+void Examples::UpdateW(int i, float delta_alpha){
+  auto Ai = examples_[0].dense_vectors()[i]->Col();
+  (*w) += Ai * Ai.constant(delta_alpha);
+}
+
+Eigen::TensorMap<Eigen::Tensor<float, 1, Eigen::RowMajor>> Examples::WAsCol() const {
+  return Eigen::TensorMap<Eigen::Tensor<float, 1, Eigen::RowMajor>>((*w).data(), (*w).dimension(0));
 }
 
 }  // namespace sdca
