@@ -69,7 +69,7 @@ struct ExampleStatistics {
   // classes, and 3 is chosen to minimize memory usage for the multiclass case.
   gtl::InlinedVector<double, 3> wx;
 
-  // Multiplication using the previous weights.
+  // // Multiplication using the previous weights.
   gtl::InlinedVector<double, 3> prev_wx;
 
   // Sum of squared feature values occurring in the example divided by
@@ -134,6 +134,7 @@ class Regularizations {
 
 class ModelWeights;
 class Examples;
+class ComputeOptions;
 
 // Struct describing a single example.
 class Example {
@@ -173,6 +174,14 @@ class Example {
           data_matrix.dimension(1));
     }
 
+    // Returns a row slice from the matrix.
+    Eigen::TensorMap<Eigen::Tensor<const float, 1, Eigen::RowMajor>> Col()
+        const {
+      return Eigen::TensorMap<Eigen::Tensor<const float, 1, Eigen::RowMajor>>(
+          data_matrix.data(),
+          data_matrix.dimension(0));
+    }
+
     // Returns a row slice as a 1 * F matrix, where F is the number of features.
     Eigen::TensorMap<Eigen::Tensor<const float, 2, Eigen::RowMajor>>
     RowAsMatrix() const {
@@ -184,6 +193,10 @@ class Example {
     const TTypes<float>::ConstMatrix data_matrix;
     const int64 row_index;
   };
+
+  const std::vector<std::unique_ptr<DenseVector>>& get_dense_vectors() const{
+    return dense_vectors_;
+  }
 
  private:
   std::vector<SparseFeatures> sparse_features_;
@@ -232,8 +245,7 @@ class FeatureWeightsDenseStorage {
     const size_t num_weight_vectors = normalized_bounded_dual_delta.size();
     if (num_weight_vectors == 1) {
       deltas_.device(device) =
-          deltas_ +
-          dense_vector.RowAsMatrix() *
+          deltas_ + dense_vector.RowAsMatrix() * 
               deltas_.constant(normalized_bounded_dual_delta[0]);
     } else {
       // Transform the dual vector into a column matrix.
@@ -249,6 +261,14 @@ class FeatureWeightsDenseStorage {
                                 product_dims))
               .cast<float>();
     }
+  }
+
+  void UpdateDenseDeltaWeights(
+    const Eigen::ThreadPoolDevice& device,
+    double delta_alpha){
+    deltas_.device(device) =
+          deltas_ + 
+              deltas_.constant(delta_alpha);
   }
 
  private:
@@ -317,7 +337,7 @@ class FeatureWeightsSparseStorage {
   std::unordered_map<int64, int64> indices_to_id_;
 };
 
-// Weights in the model, wraps both current weights, and the delta weights
+// Weights in the model, wraps both current weights (alpha), and the delta weights (alpha)
 // for both sparse and dense features.
 class ModelWeights {
  public:
@@ -349,7 +369,10 @@ class ModelWeights {
     }
   }
 
-  float ComputeLASSOWeight(const Examples& examples, int id, float l1);
+  void UpdateDeltaWeights(const Eigen::ThreadPoolDevice& device, 
+      const float delta_alpha, int i){
+    dense_weights_[i].UpdateDenseDeltaWeights(device, delta_alpha);
+  }
 
   Status Initialize(OpKernelContext* const context) {
     OpInputList sparse_indices_inputs;
@@ -418,7 +441,7 @@ class ModelWeights {
  private:
   std::vector<FeatureWeightsSparseStorage> sparse_weights_;
   std::vector<FeatureWeightsDenseStorage> dense_weights_;
-
+  
   TF_DISALLOW_COPY_AND_ASSIGN(ModelWeights);
 };
 
@@ -602,6 +625,13 @@ class Examples {
 
   int num_features() const { return num_features_; }
 
+  Eigen::TensorMap<Eigen::Tensor<const float, 1, Eigen::RowMajor>> 
+  get_feature(int i) const { 
+    auto mat = examples_[0].dense_vectors_[i]->data_matrix;
+    return Eigen::TensorMap<Eigen::Tensor<const float, 1, Eigen::RowMajor>>
+            (mat.data(), mat.dimension(0));
+  }
+
   // Initialize() must be called immediately after construction.
   // TODO(sibyl-Aix6ihai): Refactor/shorten this function.
   Status Initialize(OpKernelContext* const context, const ModelWeights& weights,
@@ -609,7 +639,16 @@ class Examples {
                     int num_sparse_features_with_values,
                     int num_dense_features);
 
+  void initialize_w(const ComputeOptions& options, const ModelWeights& model_weights);
+
+  float compute_Ai_dot_R(int i) ;
+
+  float compute_Ai_squared(int i)  ;
+
+  void update_w(int i, float delta_alpha);
  private:
+  Eigen::TensorMap<Eigen::Tensor<float, 1, Eigen::RowMajor>> WAsCol() ;
+
   // Reads the input tensors, and builds the internal representation for sparse
   // features per example. This function modifies the |examples| passed in
   // to build the sparse representations.
@@ -639,6 +678,8 @@ class Examples {
 
   // All examples in the batch.
   std::vector<Example> examples_;
+
+  std::unique_ptr<Eigen::Tensor<float, 2, Eigen::RowMajor> > w;
 
   // Adaptative sampling variables
   std::vector<float> probabilities_;
@@ -713,6 +754,8 @@ Status Examples::Initialize(OpKernelContext* const context,
   ComputeSquaredNormPerExample(worker_threads, num_examples,
                                num_sparse_features, num_dense_features,
                                &examples_);
+
+  w.reset(new Eigen::Tensor<float, 2, Eigen::RowMajor>(num_examples, 1));
   return Status::OK();
 }
 
@@ -872,56 +915,6 @@ double SoftThreshold(const double alpha, const double gamma){
   return std::copysign(shrink, alpha);
 }
 
-float ModelWeights::ComputeLASSOWeight(const Examples& examples, int id, float l1){
-
-  // feature corresponding to id's
-  TTypes<float>::ConstMatrix mat(examples.example(0).dense_vectors_[id]->data_matrix);
-  TTypes<const float>::Matrix current_feature(mat.data(), mat.dimension(0), 1);
-  
-  // initialize r with b = [1, 1, ..., 1]
-  Eigen::Tensor<float, 2, Eigen::RowMajor> r(current_feature.constant(1));
-
-  // compute R = b - A*\alpha
-  for (int feature_id = 0; feature_id < examples.num_features(); feature_id++){
-      // Eigen::TensorMap<Eigen::Tensor<float, 2, Eigen::RowMajor>> 
-    TTypes<float>::ConstMatrix mat(examples.example(0).dense_vectors_[feature_id]->data_matrix);
-    TTypes<const float>::Matrix feature(mat.data(), mat.dimension(0), 1);
-    r -= feature * feature.constant(dense_weights_[feature_id].get_weight());
-  }
-
-  Eigen::Tensor<float, 0, Eigen::RowMajor> tmp;
-  // tmp = r.square().sum();
-  // std::cout << "check r squared are the same = " << tmp()/2 << std::endl;
-
-  // Compute Ai*r, ||Ai||^2
-  tmp = (current_feature * r).sum();
-  float Air = tmp();
-  tmp = current_feature.square().sum();
-  float Ai_squared_norm = tmp();
-
-  // Compute new alpha
-  float candidate = Air/Ai_squared_norm + dense_weights_[id].get_weight();
-  float new_alpha = SoftThreshold(candidate, l1/Ai_squared_norm);
-
-  // Compute The tensor between here and there.
-  TTypes<float>::Matrix deltas = dense_weights_[id].deltas();
-
-  // Update alpha by updating deltas
-  deltas(0, 0) = new_alpha - dense_weights_[id].get_weight();
-
-  // Update residual r to calculate loss
-  r -= current_feature * current_feature.constant(deltas(0, 0));
-
-  // debugging information
-  // std::cout << "Air = " << Air << ", Ai_squared_norm = " << Ai_squared_norm 
-  //           << ", candidate = " << candidate << ", new_alpha = " << new_alpha 
-  //           << ", new weight = " << dense_weights_[id].get_weight() << std::endl;
-
-  Eigen::Tensor<float, 0, Eigen::RowMajor> loss(r.square().sum());
-  return loss()/2;
-}
-
-
 struct ComputeOptions {
   ComputeOptions(OpKernelConstruction* const context) {
     string loss_type;
@@ -974,6 +967,44 @@ struct ComputeOptions {
   Regularizations regularizations;
 };
 
+void Examples::initialize_w(const ComputeOptions& options, const ModelWeights& model_weights){
+        // Compute residual
+   for (size_t i = 0; i < num_examples(); ++i){
+
+      const ExampleStatistics example_statistics =
+      examples_[i].ComputeWxAndWeightedExampleNorm(
+          options.num_loss_partitions, model_weights,
+          options.regularizations, 1 /* num_weight_vectors */);
+
+      float example_label = examples_[i].example_label();
+      (*w)(i, 0) = example_statistics.wx[0] - example_label;
+    }
+}
+
+// Compute inner product of Ai and residual
+float Examples::compute_Ai_dot_R(int i) {
+  // auto r = -WAsCol();
+  auto Ai = examples_[0].get_dense_vectors()[i]->Col();
+  // std::cout << "r = \n" << r << "Ai = " << Ai << std::endl;
+  const Eigen::Tensor<float, 0, Eigen::RowMajor> sn = (Ai * WAsCol()).sum();
+  return -sn();
+}
+
+float Examples::compute_Ai_squared(int i) {
+  auto Ai = examples_[0].get_dense_vectors()[i]->Col();
+  const Eigen::Tensor<float, 0, Eigen::RowMajor> sn = Ai.square().sum();
+  return sn();
+}
+
+void Examples::update_w(int i, float delta_alpha){
+  auto Ai = examples_[0].get_dense_vectors()[i]->Col();
+  (*w) += Ai * Ai.constant(delta_alpha);
+}
+
+Eigen::TensorMap<Eigen::Tensor<float, 1, Eigen::RowMajor>> Examples::WAsCol()  {
+  return Eigen::TensorMap<Eigen::Tensor<float, 1, Eigen::RowMajor>>((*w).data(), (*w).dimension(0));
+}
+
 // TODO(shengx): The helper classes/methods are changed to support multiclass
 // SDCA, which lead to changes within this function. Need to revisit the
 // convergence once the multiclass SDCA is in.
@@ -987,6 +1018,7 @@ void DoCompute(const ComputeOptions& options, OpKernelContext* const context) {
       examples.Initialize(context, model_weights, options.num_sparse_features,
                           options.num_sparse_features_with_values,
                           options.num_dense_features));
+
 
   const Tensor* example_state_data_t;
   OP_REQUIRES_OK(context,
@@ -1010,94 +1042,50 @@ void DoCompute(const ComputeOptions& options, OpKernelContext* const context) {
                      model_weights, example_state_data, options.loss_updater));
   }
 
+  examples.initialize_w(options, model_weights);
+
+
   mutex mu;
   Status train_step_status GUARDED_BY(mu);
   std::atomic<std::int64_t> atomic_index(-1);
-  // auto train_step = [&](const int64 begin, const int64 end) {
-  //   // The static_cast here is safe since begin and end can be at most
-  //   // num_examples which is an int.
-  //   for (int id = static_cast<int>(begin); id < end; ++id) {
-  //     const int64 example_index =
-  //         examples.sampled_index(++atomic_index, options.adaptative);
-  //     const Example& example = examples.example(example_index);
-  //     const float dual = example_state_data(example_index, 0);
-  //     const float example_weight = example.example_weight();
-  //     float example_label = example.example_label();
-  //     const Status conversion_status =
-  //         options.loss_updater->ConvertLabel(&example_label);
-  //     if (!conversion_status.ok()) {
-  //       mutex_lock l(mu);
-  //       train_step_status = conversion_status;
-  //       // Return from this worker thread - the calling thread is
-  //       // responsible for checking context status and returning on error.
-  //       return;
-  //     }
 
-  //     // Compute wx, example norm weighted by regularization, dual loss,
-  //     // primal loss.
-  //     // For binary SDCA, num_weight_vectors should be one.
-  //     const ExampleStatistics example_statistics =
-  //         example.ComputeWxAndWeightedExampleNorm(
-  //             options.num_loss_partitions, model_weights,
-  //             options.regularizations, 1 /* num_weight_vectors */);
-
-  //     const double new_dual = options.loss_updater->ComputeUpdatedDual(
-  //         options.num_loss_partitions, example_label, example_weight, dual,
-  //         example_statistics.wx[0], example_statistics.normalized_squared_norm);
-
-  //     // Compute new weights.
-  //     const double normalized_bounded_dual_delta =
-  //         (new_dual - dual) * example_weight /
-  //         options.regularizations.symmetric_l2();
-  //     model_weights.UpdateDeltaWeights(
-  //         context->eigen_cpu_device(), example,
-  //         std::vector<double>{normalized_bounded_dual_delta});
-
-  //     // Update example data.
-  //     example_state_data(example_index, 0) = new_dual;
-  //     example_state_data(example_index, 1) =
-  //         options.loss_updater->ComputePrimalLoss(
-  //             example_statistics.prev_wx[0], example_label, example_weight);
-  //     example_state_data(example_index, 2) =
-  //         options.loss_updater->ComputeDualLoss(dual, example_label,
-  //                                               example_weight);
-  //     example_state_data(example_index, 3) = example_weight;
-  //   }
-  // };
-
-  auto train_step_primal = [&](const int64 begin, const int64 end) {
+  auto train_step = [&](const int64 begin, const int64 end) {
     // The static_cast here is safe since begin and end can be at most
     // num_examples which is an int.
     for (int id = static_cast<int>(begin); id < end; ++id) {
-      double primal_loss = model_weights.ComputeLASSOWeight(
-            examples, id, options.regularizations.symmetric_l1());
-      std::cout << "\033[1;31mId = " << id << ", Primal Loss = " << primal_loss << "\033[0m" << std::endl;
+      // const Example& example = examples.example(id);
+      float alpha = model_weights.dense_weights()[id].get_weight();
+
+      float air = examples.compute_Ai_dot_R(id);
+
+      float ai_squared = examples.compute_Ai_squared(id);
+
+      float candidate = air/ai_squared + alpha;
+      float new_alpha = SoftThreshold(candidate, 
+        options.regularizations.symmetric_l1()/ai_squared);
+
+      model_weights.UpdateDeltaWeights(
+          context->eigen_cpu_device(), new_alpha - alpha, id);
+
+      examples.update_w(id, new_alpha - alpha);
+
+      // std::cout << "\033[1;31mId = " << id 
+      //     << ", new alpha  = " << new_alpha 
+      //     << ", alpha      = " << alpha 
+      //     << ", squared_ai = " << ai_squared
+      //     << ", air        = " << air
+      //     << "\033[0m" << std::endl;
     }
   };
+
   // TODO(sibyl-Aix6ihai): Tune this properly based on sparsity of the data,
   // number of cpus, and cost per example.
-  // const int64 kCostPerUnit = examples.num_features();
-  // const DeviceBase::CpuWorkerThreads& worker_threads =
-  //     *context->device()->tensorflow_cpu_worker_threads();
-
-  // Shard(worker_threads.num_threads, worker_threads.workers,
-  //       examples.num_examples(), kCostPerUnit, train_step);
-
   const int64 kCostPerUnit = examples.num_examples();
   const DeviceBase::CpuWorkerThreads& worker_threads =
       *context->device()->tensorflow_cpu_worker_threads();
 
   Shard(worker_threads.num_threads, worker_threads.workers,
-        examples.num_features(), kCostPerUnit, train_step_primal);
-
-  std::cout << "\033[1;31mweight = [";
-  for (int i = 0; i < examples.num_features(); ++i){
-    std::cout << model_weights.dense_weights()[i].get_weight() << ", ";
-    if (i % 5 == 4) {
-      std::cout << "\n          ";
-    }
-  }
-  std::cout << "]\033[0m" << std::endl;
+        examples.num_features(), kCostPerUnit, train_step);
 
   OP_REQUIRES_OK(context, train_step_status);
 }
