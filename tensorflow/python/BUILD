@@ -1204,7 +1204,10 @@ py_library(
 
 py_library(
     name = "rnn_cell",
-    srcs = ["ops/rnn_cell.py"],
+    srcs = [
+        "ops/rnn_cell.py",
+        "ops/rnn_cell_impl.py",
+    ],
     srcs_version = "PY2AND3",
     deps = [
         ":array_ops",
@@ -1807,7 +1810,7 @@ tf_proto_library(
     name = "cpp_shape_inference_proto",
     srcs = ["framework/cpp_shape_inference.proto"],
     cc_api_version = 2,
-    cc_libs = ["//tensorflow/core:protos_all_cc"],
+    protodeps = ["//tensorflow/core:protos_all"],
 )
 
 py_test(
@@ -1906,28 +1909,6 @@ cuda_py_tests(
     ],
 )
 
-py_library(
-    name = "net_lib",
-    testonly = 1,
-    srcs = ["util/net_lib.py"],
-    srcs_version = "PY2AND3",
-    deps = [
-        ":pywrap_tensorflow",
-    ],
-)
-
-py_tests(
-    name = "net_lib_test",
-    size = "small",
-    srcs = [
-        "util/net_lib_test.py",
-    ],
-    additional_deps = [
-        ":net_lib",
-        "//tensorflow:tensorflow_py",
-    ],
-)
-
 tf_cuda_library(
     name = "tf_session_helper",
     srcs = ["client/tf_session_helper.cc"],
@@ -1954,7 +1935,6 @@ tf_py_wrap_cc(
     swig_includes = [
         "client/device_lib.i",
         "client/events_writer.i",
-        "client/net_lib.i",
         "client/quantize_training.i",
         "client/tf_session.i",
         "framework/cpp_shape_inference.i",

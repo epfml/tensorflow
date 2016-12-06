@@ -92,7 +92,7 @@ def log_poisson_loss(log_input, targets, compute_full_loss=False, name=None):
       zeros = array_ops.zeros_like(targets, dtype=targets.dtype)
       ones = array_ops.ones_like(targets, dtype=targets.dtype)
       cond = math_ops.logical_and(targets >= zeros, targets <= ones)
-      result += math_ops.select(cond, zeros, stirling_approx)
+      result += array_ops.where(cond, zeros, stirling_approx)
     return result
 
 
@@ -157,8 +157,8 @@ def sigmoid_cross_entropy_with_logits(logits, targets, name=None):
     # abs functions.
     zeros = array_ops.zeros_like(logits, dtype=logits.dtype)
     cond = (logits >= zeros)
-    relu_logits = math_ops.select(cond, logits, zeros)
-    neg_abs_logits = math_ops.select(cond, -logits, logits)
+    relu_logits = array_ops.where(cond, logits, zeros)
+    neg_abs_logits = array_ops.where(cond, -logits, logits)
     return math_ops.add(relu_logits - logits * targets,
                         math_ops.log1p(math_ops.exp(neg_abs_logits)),
                         name=name)
@@ -292,7 +292,7 @@ def zero_fraction(value, name=None):
 
   ```python
       z = tf.Relu(...)
-      summ = tf.scalar_summary('sparsity', tf.nn.zero_fraction(z))
+      summ = tf.contrib.deprecated.scalar_summary('sparsity', tf.nn.zero_fraction(z))
   ```
 
   Args:
@@ -463,15 +463,15 @@ def sufficient_statistics(x, axes, shift=None, keep_dims=False, name=None):
   with ops.name_scope(name, "sufficient_statistics", [x, shift]):
     x = ops.convert_to_tensor(x, name="x")
     x_shape = x.get_shape()
-    if x_shape.is_fully_defined():
+    if all(x_shape[d].value is not None for d in axes):
       counts = 1
       for d in axes:
         counts *= x_shape[d].value
       counts = constant_op.constant(counts, dtype=x.dtype)
     else:  # shape needs to be inferred at runtime.
-      x_dims = array_ops.gather(array_ops.shape(x), axes)
-      counts = math_ops.cast(
-          math_ops.reduce_prod(x_dims), x.dtype, name="count")
+      x_dims = array_ops.gather(
+          math_ops.cast(array_ops.shape(x), x.dtype), axes)
+      counts = math_ops.reduce_prod(x_dims, name="count")
     if shift is not None:
       shift = ops.convert_to_tensor(shift, name="shift")
       m_ss = math_ops.sub(x, shift)
