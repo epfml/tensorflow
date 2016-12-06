@@ -157,13 +157,6 @@ float ComputeL1DualityGap(const ModelWeights& model_weights, const Examples& exa
     max_At_w = std::max(std::abs(sn()), max_At_w);
   }
 
-  std::cout << "l1_regularized = " << l1_regularized
-            << ", l1 = " << l1
-            << ", B = " << B 
-            << ", w_A_alpha = " << w_A_alpha
-            << ", max_At_w = " << max_At_w
-            << std::endl;
-
   return w_A_alpha + B * std::max(max_At_w - l1, static_cast<float>(0)) + l1_regularized;
 }
 
@@ -207,7 +200,6 @@ void DoCompute(const ComputeOptions& options, OpKernelContext* const context) {
   examples.InitializeW(options.num_loss_partitions, options.regularizations, 
                        model_weights);
 
-
   mutex mu;
   Status train_step_status GUARDED_BY(mu);
   std::atomic<std::int64_t> atomic_index(-1);
@@ -222,6 +214,10 @@ void DoCompute(const ComputeOptions& options, OpKernelContext* const context) {
 
       float ai_squared = examples.ComputeAiSquared(id);
 
+      if (std::abs(ai_squared) < 10e-10){
+        continue;
+      }
+
       float candidate = air/ai_squared + alpha;
       float new_alpha = SoftThreshold(candidate, 
         options.regularizations.symmetric_l1()/ai_squared);
@@ -231,13 +227,13 @@ void DoCompute(const ComputeOptions& options, OpKernelContext* const context) {
 
       examples.UpdateW(id, new_alpha - alpha);
 
-      std::cout << "\033[1;31mId = " << id 
-          << ", l1 = " << options.regularizations.symmetric_l1()
-          << ", new alpha  = " << new_alpha 
-          << ", alpha      = " << alpha 
-          << ", squared_ai = " << ai_squared
-          << ", air        = " << air
-          << "\033[0m" << std::endl;
+      // std::cout << "\033[1;31mId = " << id
+      //     << ", l1 = " << options.regularizations.symmetric_l1()
+      //     << ", new alpha  = " << model_weights.dense_weights()[id].weight()
+      //     << ", alpha      = " << alpha 
+      //     << ", squared_ai = " << ai_squared
+      //     << ", air        = " << air
+      //     << "\033[0m" << std::endl;
     }
   };
 
@@ -252,6 +248,7 @@ void DoCompute(const ComputeOptions& options, OpKernelContext* const context) {
 
   std::cout << "Duality Gap = " << ComputeL1DualityGap(model_weights, examples, options)
             << std::endl;
+
   OP_REQUIRES_OK(context, train_step_status);
 }
 
@@ -283,30 +280,32 @@ class SdcaShrinkL1 : public OpKernel {
   }
 
   void Compute(OpKernelContext* const context) override {
-    OpMutableInputList weights_inputs;
-    OP_REQUIRES_OK(context,
-                   context->mutable_input_list("weights", &weights_inputs));
+    // OpMutableInputList weights_inputs;
+    // OP_REQUIRES_OK(context,
+    //                context->mutable_input_list("weights", &weights_inputs));
 
-    auto do_work = [&](const int64 begin, const int64 end) {
-      for (int i = begin; i < end; ++i) {
-        auto prox_w = weights_inputs.at(i, /*lock_held=*/true).flat<float>();
-        prox_w.device(context->eigen_cpu_device()) =
-            regularizations_.EigenShrinkVector(prox_w);
-      }
-    };
+    // auto do_work = [&](const int64 begin, const int64 end) {
+    //   for (int i = begin; i < end; ++i) {
+    //     auto prox_w = weights_inputs.at(i, /*lock_held=*/true).flat<float>();
+    //     std::cout << "i = " << i << ", prox w = " <<  prox_w << std::endl;
+    //     prox_w.device(context->eigen_cpu_device()) =
+    //         regularizations_.EigenShrinkVector(prox_w);
+    //   }
+    // };
 
-    if (weights_inputs.size() > 0) {
-      int64 num_weights = 0;
-      for (int i = 0; i < weights_inputs.size(); ++i) {
-        num_weights += weights_inputs.at(i, /*lock_held=*/true).NumElements();
-      }
-      // TODO(sibyl-Aix6ihai): Tune this value.
-      const int64 kCostPerUnit = (num_weights * 50) / weights_inputs.size();
-      const DeviceBase::CpuWorkerThreads& worker_threads =
-          *context->device()->tensorflow_cpu_worker_threads();
-      Shard(worker_threads.num_threads, worker_threads.workers,
-            weights_inputs.size(), kCostPerUnit, do_work);
-    }
+    // //  This Part of Code will not be used for LASSO as we don't shrink weight.
+    // if (weights_inputs.size() > 0) {
+    //   int64 num_weights = 0;
+    //   for (int i = 0; i < weights_inputs.size(); ++i) {
+    //     num_weights += weights_inputs.at(i, /*lock_held=*/true).NumElements();
+    //   }
+    //   // TODO(sibyl-Aix6ihai): Tune this value.
+    //   const int64 kCostPerUnit = (num_weights * 50) / weights_inputs.size();
+    //   const DeviceBase::CpuWorkerThreads& worker_threads =
+    //       *context->device()->tensorflow_cpu_worker_threads();
+    //   Shard(worker_threads.num_threads, worker_threads.workers,
+    //         weights_inputs.size(), kCostPerUnit, do_work);
+    // }
   }
 
  private:

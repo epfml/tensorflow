@@ -208,6 +208,7 @@ const ExampleStatistics Example::ComputeWxAndWeightedExampleNorm(
         dense_weights.nominals() +
         dense_weights.deltas() *
             dense_weights.deltas().constant(num_loss_partitions);
+
     if (num_weight_vectors == 1) {
       const Eigen::Tensor<float, 0, Eigen::RowMajor> prev_prediction =
           (dense_vector.Row() *
@@ -218,9 +219,9 @@ const ExampleStatistics Example::ComputeWxAndWeightedExampleNorm(
               .sum();
       const Eigen::Tensor<float, 0, Eigen::RowMajor> prediction =
           (dense_vector.Row() *
-           regularization.EigenShrinkVector(
+           // regularization.EigenShrinkVector(
                Eigen::TensorMap<Eigen::Tensor<const float, 1, Eigen::RowMajor>>(
-                   feature_weights.data(), feature_weights.dimension(1))))
+                   feature_weights.data(), feature_weights.dimension(1)))
               .sum();
       result.prev_wx[0] += prev_prediction();
       result.wx[0] += prediction();
@@ -540,6 +541,8 @@ void Examples::ComputeSquaredNormPerExample(
 
 void Examples::InitializeW(const int num_loss_partitions, 
   const Regularizations& regularization, const ModelWeights& model_weights){
+
+    w.reset(new Eigen::Tensor<float, 2, Eigen::RowMajor>(num_examples(), 1));
     for (unsigned int i = 0; i < num_examples(); ++i){
       const ExampleStatistics example_statistics =
       examples_[i].ComputeWxAndWeightedExampleNorm(
