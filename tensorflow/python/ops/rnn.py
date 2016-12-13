@@ -305,6 +305,15 @@ def state_saving_rnn(cell, inputs, state_saver, state_name,
   return (outputs, state)
 
 
+def _on_device(fn, device):
+  """Build the subgraph defined by lambda `fn` on `device` if it's not None."""
+  if device:
+    with ops.device(device):
+      return fn()
+  else:
+    return fn()
+
+
 # pylint: disable=unused-argument
 def _rnn_step(
     time, sequence_length, min_sequence_length, max_sequence_length,
@@ -366,7 +375,9 @@ def _rnn_step(
 
   def _copy_one_through(output, new_output):
     copy_cond = (time >= sequence_length)
-    return array_ops.where(copy_cond, output, new_output)
+    return _on_device(
+        lambda: array_ops.where(copy_cond, output, new_output),
+        device=new_output.op.device)
 
   def _copy_some_through(flat_new_output, flat_new_state):
     # Use broadcasting select to determine which values should get
@@ -550,8 +561,9 @@ def bidirectional_rnn(cell_fw, cell_bw, inputs,
   flat_output_fw = nest.flatten(output_fw)
   flat_output_bw = nest.flatten(output_bw)
 
-  flat_outputs = tuple(array_ops.concat(1, [fw, bw])
-                       for fw, bw in zip(flat_output_fw, flat_output_bw))
+  flat_outputs = tuple(
+      array_ops.concat_v2([fw, bw], 1)
+      for fw, bw in zip(flat_output_fw, flat_output_bw))
 
   outputs = nest.pack_sequence_as(structure=output_fw,
                                   flat_sequence=flat_outputs)
@@ -632,7 +644,7 @@ def bidirectional_dynamic_rnn(cell_fw, cell_bw, inputs, sequence_length=None,
         It returns a tuple instead of a single concatenated `Tensor`, unlike
         in the `bidirectional_rnn`. If the concatenated one is preferred,
         the forward and backward outputs can be concatenated as
-        `tf.concat(2, outputs)`.
+        `tf.concat_v2(outputs, 2)`.
       output_states: A tuple (output_state_fw, output_state_bw) containing
         the forward and the backward final states of bidirectional rnn.
 
@@ -1082,7 +1094,7 @@ def raw_rnn(cell, loop_fn,
   inputs_ta = tf.TensorArray(dtype=tf.float32, size=max_time)
   inputs_ta = inputs_ta.unpack(inputs)
 
-  cell = tf.nn.rnn_cell.LSTMCell(num_units)
+  cell = tf.contrib.rnn.LSTMCell(num_units)
 
   def loop_fn(time, cell_output, cell_state, loop_state):
     emit_output = cell_output  # == None for time == 0
@@ -1296,11 +1308,17 @@ def raw_rnn(cell, loop_fn,
       loop_state = loop_state if next_loop_state is None else next_loop_state
 
       def _copy_some_through(current, candidate):
+        """Copy some tensors through via array_ops.where."""
         current_flat = nest.flatten(current)
         candidate_flat = nest.flatten(candidate)
+        # pylint: disable=g-long-lambda,cell-var-from-loop
         result_flat = [
-            array_ops.where(elements_finished, current_i, candidate_i)
+            _on_device(
+                lambda: array_ops.where(
+                    elements_finished, current_i, candidate_i),
+                device=candidate_i.op.device)
             for (current_i, candidate_i) in zip(current_flat, candidate_flat)]
+        # pylint: enable=g-long-lambda,cell-var-from-loop
         return nest.pack_sequence_as(
             structure=current, flat_sequence=result_flat)
 

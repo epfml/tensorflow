@@ -181,7 +181,7 @@ def _input_from_feature_columns(columns_to_tensors,
           except ValueError as e:
             raise ValueError('Error creating input layer for column: {}.\n'
                              '{}, {}'.format(column.name, e, ee))
-    return array_ops.concat(output_rank - 1, output_tensors)
+    return array_ops.concat_v2(output_tensors, output_rank - 1)
 
 
 def input_from_feature_columns(columns_to_tensors,
@@ -371,7 +371,7 @@ def _create_joint_embedding_lookup(columns_to_tensors,
     sparse_tensors.append(
         sparse_tensor_py.SparseTensor(t.indices,
                                       values,
-                                      t.shape))
+                                      t.dense_shape))
   sparse_tensor = sparse_ops.sparse_concat(1, sparse_tensors)
   with variable_scope.variable_scope(
       None, default_name='linear_weights', values=columns_to_tensors.values()):

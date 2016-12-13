@@ -73,6 +73,7 @@ struct ExampleStatistics {
       : wx(num_weight_vectors, 0.0), prev_wx(num_weight_vectors, 0.0) {}
 };
 
+// Managing regularization terms.
 class Regularizations {
  public:
   Regularizations(){};
@@ -432,6 +433,9 @@ class Examples {
 
   // store primal weight w
   std::unique_ptr<Eigen::Tensor<float, 2, Eigen::RowMajor> > w;
+
+  // vector of gradient
+  std::unique_ptr<Eigen::Tensor<float, 2, Eigen::RowMajor> > grad;
 
   // Adaptative sampling variables
   std::vector<float> probabilities_;

@@ -153,6 +153,8 @@ float ComputeL1DualityGap(const ModelWeights& model_weights, const Examples& exa
   for (int i = 0; i < examples.num_features(); ++i){
     auto Ai = examples.Ai(i);
     auto w  = examples.WAsCol();
+    // float sn =0;
+    // sn() = (Ai * w).sum();
     Eigen::Tensor<float, 0, Eigen::RowMajor> sn = (Ai * w).sum();
     max_At_w = std::max(std::abs(sn()), max_At_w);
   }
@@ -197,12 +199,16 @@ void DoCompute(const ComputeOptions& options, OpKernelContext* const context) {
                        /*num_weight_vectors =*/1));
   }
 
+  // example_state_data(0, 0) += 1;
+  // std::cout << "Training step (outer loop) = " <<  example_state_data(0, 0) << std::endl;
+
   examples.InitializeW(options.num_loss_partitions, options.regularizations, 
                        model_weights);
 
   mutex mu;
   Status train_step_status GUARDED_BY(mu);
   std::atomic<std::int64_t> atomic_index(-1);
+
   auto train_step = [&](const int64 begin, const int64 end) {
     // The static_cast here is safe since begin and end can be at most
     // num_examples which is an int.
@@ -234,17 +240,30 @@ void DoCompute(const ComputeOptions& options, OpKernelContext* const context) {
       //     << ", squared_ai = " << ai_squared
       //     << ", air        = " << air
       //     << "\033[0m" << std::endl;
+      // std :: cout << options.regularizations.symmetric_l1() << std :: endl;
+
     }
   };
 
   // TODO(sibyl-Aix6ihai): Tune this properly based on sparsity of the data,
   // number of cpus, and cost per example.
+  std::cout<< "number of features = " << examples.num_features()<< std::endl;
   const int64 kCostPerUnit = examples.num_examples();
   const DeviceBase::CpuWorkerThreads& worker_threads =
       *context->device()->tensorflow_cpu_worker_threads();
 
   Shard(worker_threads.num_threads, worker_threads.workers,
         examples.num_features(), kCostPerUnit, train_step);
+
+  // for (int i = 0 ; i < examples.num_features(); ++i){
+  //   std::cout << model_weights.dense_weights()[i].deltas() << std::endl;
+  // }
+  // 
+ //  std:: cout << "\033[1;31m Labels \033[0m"<< std::endl;
+ // for (int i = 0 ; i < examples.num_examples() ; ++i){
+ //  std :: cout << examples.example(i).example_label()<< std :: endl;
+ // }
+
 
   std::cout << "Duality Gap = " << ComputeL1DualityGap(model_weights, examples, options)
             << std::endl;

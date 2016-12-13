@@ -541,8 +541,10 @@ void Examples::ComputeSquaredNormPerExample(
 
 void Examples::InitializeW(const int num_loss_partitions, 
   const Regularizations& regularization, const ModelWeights& model_weights){
-
+    // Allocate memory for primal weight w.
     w.reset(new Eigen::Tensor<float, 2, Eigen::RowMajor>(num_examples(), 1));
+
+    // Initialize weight with $w = A\alpha - b$
     for (unsigned int i = 0; i < num_examples(); ++i){
       const ExampleStatistics example_statistics =
       examples_[i].ComputeWxAndWeightedExampleNorm(

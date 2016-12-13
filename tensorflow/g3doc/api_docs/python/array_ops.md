@@ -441,7 +441,7 @@ For example:
 ```prettyprint
 # 't' is a tensor of shape [1, 2, 1, 3, 1, 1]
 shape(squeeze(t)) ==> [2, 3]
-          ```
+```
 
 Or, to remove specific size 1 dimensions:
 
@@ -635,7 +635,7 @@ tf.slice(input, [1, 0, 0], [2, 1, 3]) ==> [[[3, 3, 3]],
 
 - - -
 
-### `tf.strided_slice(input_, begin, end, strides, begin_mask=0, end_mask=0, ellipsis_mask=0, new_axis_mask=0, shrink_axis_mask=0, var=None, name=None)` {#strided_slice}
+### `tf.strided_slice(input_, begin, end, strides=None, begin_mask=0, end_mask=0, ellipsis_mask=0, new_axis_mask=0, shrink_axis_mask=0, var=None, name=None)` {#strided_slice}
 
 Extracts a strided slice from a tensor.
 
@@ -724,19 +724,19 @@ tf.strided_slice(input, [1, 1, 0], [2, -1, 3], [1, -1, 1]) ==>[[[4, 4, 4],
 
 - - -
 
-### `tf.split(split_dim, num_split, value, name='split')` {#split}
+### `tf.split(axis=None, num_or_size_splits=None, value=None, name='split', split_dim=None)` {#split}
 
-Splits a tensor into `num_split` tensors along one dimension.
+DEPRECATED: use split_v; split_v rename to split happening soon.
 
-Splits `value` along dimension `split_dim` into `num_split` smaller tensors.
-Requires that `num_split` evenly divide `value.shape[split_dim]`.
+Splits `value` along dimension `axis` into `num_or_size_splits` smaller
+tensors. Requires that `num_or_size_splits` evenly divide `value.shape[axis]`.
 
 For example:
 
 ```python
 # 'value' is a tensor with shape [5, 30]
 # Split 'value' into 3 tensors along dimension 1
-split0, split1, split2 = tf.split(1, 3, value)
+split0, split1, split2 = tf.split(value=value, num_or_size_splits=3, axis=1)
 tf.shape(split0) ==> [5, 10]
 ```
 
@@ -745,7 +745,8 @@ using unpack, e.g.
 
 ```python
 num_items = t.get_shape()[axis].value
-[tf.squeeze(s, [axis]) for s in tf.split(axis, num_items, t)]
+[tf.squeeze(s, [axis]) for s in
+ tf.split(value=t, num_or_size_splits=num_items, axis=axis)]
 ```
 
 can be rewritten as
@@ -757,42 +758,44 @@ tf.unpack(t, axis=axis)
 ##### Args:
 
 
-*  <b>`split_dim`</b>: A 0-D `int32` `Tensor`. The dimension along which to split.
+*  <b>`axis`</b>: A 0-D `int32` `Tensor`. The dimension along which to split.
     Must be in the range `[0, rank(value))`.
-*  <b>`num_split`</b>: A Python integer. The number of ways to split.
+*  <b>`num_or_size_splits`</b>: A Python integer. The number of ways to split. Has a
+    different meaning in split_v (see docs).
 *  <b>`value`</b>: The `Tensor` to split.
 *  <b>`name`</b>: A name for the operation (optional).
+*  <b>`split_dim`</b>: The old (deprecated) name for axis.
 
 ##### Returns:
 
-  `num_split` `Tensor` objects resulting from splitting `value`.
+  `num_or_size_splits` `Tensor` objects resulting from splitting `value`.
 
 
 - - -
 
-### `tf.split_v(value, size_splits, split_dim=0, num=None, name='split_v')` {#split_v}
+### `tf.split_v(value=None, num_or_size_splits=None, axis=0, num=None, name='split_v')` {#split_v}
 
 Splits a tensor into sub tensors.
 
-If size_splits is a scalar, `num_split`, then
-splits `value` along dimension `split_dim` into `num_split` smaller tensors.
-Requires that `num_split` evenly divide `value.shape[split_dim]`.
+If `num_or_size_splits` is a scalar, `num_split`, then splits `value` along
+dimension `axis` into `num_split` smaller tensors.
+Requires that `num_split` evenly divides `value.shape[axis]`.
 
-If size_splits is a tensor, then
-splits `value` into len(size_splits) pieces each the same size as the input
-except along dimension split_dim where the size is size_splits[i].
+If `num_or_size_splits` is a tensor, `size_splits`, then splits `value` into
+`len(size_splits)` pieces. The shape of the `i`-th piece has the same size as
+the `value` except along dimension `axis` where the size is `size_splits[i]`.
 
 For example:
 
 ```python
 # 'value' is a tensor with shape [5, 30]
 # Split 'value' into 3 tensors with sizes [4, 15, 11] along dimension 1
-split0, split1, split2 = tf.split_v(1, [4, 15, 11], value)
+split0, split1, split2 = tf.split_v(value, [4, 15, 11], 1)
 tf.shape(split0) ==> [5, 4]
 tf.shape(split1) ==> [5, 15]
 tf.shape(split2) ==> [5, 11]
 # Split 'value' into 3 tensors along dimension 1
-split0, split1, split2 = tf.split(value, 3, 1)
+split0, split1, split2 = tf.split(value=1, num_or_size_splits=3, axis=value)
 tf.shape(split0) ==> [5, 10]
 ```
 
@@ -800,20 +803,23 @@ tf.shape(split0) ==> [5, 10]
 
 
 *  <b>`value`</b>: The `Tensor` to split.
-*  <b>`size_splits`</b>: Either an integer indicating the number of splits along
+*  <b>`num_or_size_splits`</b>: Either an integer indicating the number of splits along
     split_dim or a 1-D Tensor containing the sizes of each output tensor
     along split_dim. If an integer then it must evenly divide
-    value.shape[split_dim]; otherwise the sum of sizes along the split
-    dimension must match that of the input.
-*  <b>`split_dim`</b>: A 0-D `int32` `Tensor`. The dimension along which to split.
+    `value.shape[axis]`; otherwise the sum of sizes along the split
+    dimension must match that of the `value`.
+*  <b>`axis`</b>: A 0-D `int32` `Tensor`. The dimension along which to split.
     Must be in the range `[0, rank(value))`. Defaults to 0.
 *  <b>`num`</b>: Optional, used to specify the number of outputs when it cannot be
-       inferred from the shape of size_splits.
+    inferred from the shape of `size_splits`.
 *  <b>`name`</b>: A name for the operation (optional).
 
 ##### Returns:
 
-  `len(size_splits)` `Tensor` objects resulting from splitting `value`.
+  if `num_or_size_splits` is a scalar returns `num_or_size_splits` `Tensor`
+  objects; if `num_or_size_splits` is a 1-D Tensor returns
+  `num_or_size_splits.get_shape[0]` `Tensor` objects resulting from splitting
+  `value`.
 
 ##### Raises:
 
@@ -1216,20 +1222,20 @@ This is the opposite of pack.  The numpy equivalent is
 
 - - -
 
-### `tf.reverse_sequence(input, seq_lengths, seq_dim, batch_dim=None, name=None)` {#reverse_sequence}
+### `tf.reverse_sequence(input, seq_lengths, seq_axis=None, batch_axis=None, name=None, seq_dim=None, batch_dim=None)` {#reverse_sequence}
 
 Reverses variable length slices.
 
-This op first slices `input` along the dimension `batch_dim`, and for each
+This op first slices `input` along the dimension `batch_axis`, and for each
 slice `i`, reverses the first `seq_lengths[i]` elements along
-the dimension `seq_dim`.
+the dimension `seq_axis`.
 
 The elements of `seq_lengths` must obey `seq_lengths[i] < input.dims[seq_dim]`,
 and `seq_lengths` must be a vector of length `input.dims[batch_dim]`.
 
-The output slice `i` along dimension `batch_dim` is then given by input
+The output slice `i` along dimension `batch_axis` is then given by input
 slice `i`, with the first `seq_lengths[i]` slices along dimension
-`seq_dim` reversed.
+`seq_axis` reversed.
 
 For example:
 
@@ -1282,8 +1288,8 @@ output[2:, :, 3, :, ...] = input[2:, :, 3, :, ...]
 *  <b>`seq_lengths`</b>: A `Tensor`. Must be one of the following types: `int32`, `int64`.
     1-D with length `input.dims(batch_dim)` and
     `max(seq_lengths) < input.dims(seq_dim)`
-*  <b>`seq_dim`</b>: An `int`. The dimension which is partially reversed.
-*  <b>`batch_dim`</b>: An optional `int`. Defaults to `0`.
+*  <b>`seq_axis`</b>: An `int`. The dimension which is partially reversed.
+*  <b>`batch_axis`</b>: An optional `int`. Defaults to `0`.
     The dimension along which reversal is performed.
 *  <b>`name`</b>: A name for the operation (optional).
 
@@ -1291,70 +1297,6 @@ output[2:, :, 3, :, ...] = input[2:, :, 3, :, ...]
 
   A `Tensor`. Has the same type as `input`.
   The partially reversed input. It has the same shape as `input`.
-
-
-- - -
-
-### `tf.reverse(tensor, dims, name=None)` {#reverse}
-
-Reverses specific dimensions of a tensor.
-
-Given a `tensor`, and a `bool` tensor `dims` representing the dimensions
-of `tensor`, this operation reverses each dimension i of `tensor` where
-`dims[i]` is `True`.
-
-`tensor` can have up to 8 dimensions. The number of dimensions
-of `tensor` must equal the number of elements in `dims`. In other words:
-
-`rank(tensor) = size(dims)`
-
-For example:
-
-```prettyprint
-# tensor 't' is [[[[ 0,  1,  2,  3],
-#                  [ 4,  5,  6,  7],
-#                  [ 8,  9, 10, 11]],
-#                 [[12, 13, 14, 15],
-#                  [16, 17, 18, 19],
-#                  [20, 21, 22, 23]]]]
-# tensor 't' shape is [1, 2, 3, 4]
-
-# 'dims' is [False, False, False, True]
-reverse(t, dims) ==> [[[[ 3,  2,  1,  0],
-                        [ 7,  6,  5,  4],
-                        [ 11, 10, 9, 8]],
-                       [[15, 14, 13, 12],
-                        [19, 18, 17, 16],
-                        [23, 22, 21, 20]]]]
-
-# 'dims' is [False, True, False, False]
-reverse(t, dims) ==> [[[[12, 13, 14, 15],
-                        [16, 17, 18, 19],
-                        [20, 21, 22, 23]
-                       [[ 0,  1,  2,  3],
-                        [ 4,  5,  6,  7],
-                        [ 8,  9, 10, 11]]]]
-
-# 'dims' is [False, False, True, False]
-reverse(t, dims) ==> [[[[8, 9, 10, 11],
-                        [4, 5, 6, 7],
-                        [0, 1, 2, 3]]
-                       [[20, 21, 22, 23],
-                        [16, 17, 18, 19],
-                        [12, 13, 14, 15]]]]
-```
-
-##### Args:
-
-
-*  <b>`tensor`</b>: A `Tensor`. Must be one of the following types: `uint8`, `int8`, `int32`, `int64`, `bool`, `half`, `float32`, `float64`, `complex64`, `complex128`.
-    Up to 8-D.
-*  <b>`dims`</b>: A `Tensor` of type `bool`. 1-D. The dimensions to reverse.
-*  <b>`name`</b>: A name for the operation (optional).
-
-##### Returns:
-
-  A `Tensor`. Has the same type as `tensor`. The same shape as `tensor`.
 
 
 - - -

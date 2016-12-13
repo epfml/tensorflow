@@ -1905,6 +1905,18 @@ def get_stats_for_node_def(graph, node, statistic_type):
   return result
 
 
+def _name_from_scope_name(name):
+  """Returns the name of an op given the name of its scope.
+
+  Args:
+    name: the name of the scope.
+
+  Returns:
+    the name of the op (equal to scope name minus any trailing slash).
+  """
+  return name[:-1] if name[-1] == "/" else name
+
+
 class Graph(object):
   """A TensorFlow computation, represented as a dataflow graph.
 
@@ -2336,7 +2348,7 @@ class Graph(object):
     # If a names ends with a '/' it is a "name scope" and we use it as-is,
     # after removing the trailing '/'.
     if name and name[-1] == "/":
-      name = name[:-1]
+      name = _name_from_scope_name(name)
     else:
       name = self.unique_name(name)
 
@@ -2887,7 +2899,7 @@ class Graph(object):
       if not name:  # Both for name=None and name="" we re-set to empty scope.
         new_stack = None
       elif name and name[-1] == "/":
-        new_stack = name[:-1]
+        new_stack = _name_from_scope_name(name)
       else:
         new_stack = self.unique_name(name)
       self._name_stack = new_stack
@@ -3980,7 +3992,7 @@ class GraphKeys(object):
     for more details.
   * `SUMMARIES`: the summary `Tensor` objects that have been created in the
     graph. See
-    [`tf.contrib.deprecated.merge_all_summaries()`](../../api_docs/python/train.md#merge_all_summaries)
+    [`tf.summary.merge_all()`](../../api_docs/python/summary.md#merge_all)
     for more details.
   * `QUEUE_RUNNERS`: the `QueueRunner` objects that are used to
     produce input for a computation. See

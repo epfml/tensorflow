@@ -17,8 +17,8 @@ def tf_workspace(path_prefix = "", tf_repo_name = ""):
   # These lines need to be changed when updating Eigen. They are parsed from
   # this file by the cmake and make builds to determine the eigen version and
   # hash.
-  eigen_version = "346ecdb306e6"
-  eigen_sha256 = "161a0b5b616fd53bd724f631a6eb4f7bf27656dde12c480176dc2264cf88ef4f"
+  eigen_version = "9569d1f35bae"
+  eigen_sha256 = "34e8347f771932964cd367b8d512234cc96917323855e622c668a339c28a3572"
 
   native.new_http_archive(
     name = "eigen_archive",
@@ -26,6 +26,19 @@ def tf_workspace(path_prefix = "", tf_repo_name = ""):
     sha256 = eigen_sha256,
     strip_prefix = "eigen-eigen-" + eigen_version,
     build_file = str(Label("//:eigen.BUILD")),
+  )
+
+  native.new_http_archive(
+    name = "libxsmm_archive",
+    url = "https://github.com/hfp/libxsmm/archive/1.5.tar.gz",
+    sha256 = "c52568c5e0e8dc9d8fcf869a716d73598e52f71c3d83af5a4c0b3be81403b423",
+    strip_prefix = "libxsmm-1.5",
+    build_file = str(Label("//:libxsmm.BUILD")),
+  )
+
+  native.bind(
+    name = "xsmm_avx",
+    actual = "@libxsmm_archive//:xsmm_avx",
   )
 
   native.http_archive(

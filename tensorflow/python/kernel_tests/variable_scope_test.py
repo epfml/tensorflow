@@ -22,6 +22,7 @@ import numpy
 import tensorflow as tf
 
 from tensorflow.python.framework import dtypes
+from tensorflow.python.ops import init_ops
 from tensorflow.python.ops import control_flow_ops
 from tensorflow.python.ops import variable_scope
 
@@ -94,6 +95,21 @@ class VariableScopeTest(tf.test.TestCase):
 
       with self.assertRaises(TypeError):
         tf.get_variable("x", initializer={})
+
+  def testInitFromNonInitializer(self):
+    with self.test_session() as sess:
+      # Test various dtypes with zeros initializer as following:
+      types = [tf.int8, tf.uint8, tf.int16, tf.uint16, tf.int32, tf.int64, 
+              tf.bool]
+
+      # Use different varibale_name to distinguish various dtypes
+      for (i, dtype) in enumerate(types):
+        x = tf.get_variable(name='x%d' % i, shape=(3, 4), dtype=dtype)
+        y = tf.get_variable(name='y%d' % i, dtype=dtype, 
+            initializer=init_ops.zeros_initializer(shape=(3, 4), dtype=dtype))
+        
+        tf.global_variables_initializer().run()
+        self.assertAllEqual(x.eval(), y.eval())
 
   def testVarScopeCachingDevice(self):
     with self.test_session():
@@ -641,7 +657,7 @@ class VariableScopeTest(tf.test.TestCase):
     varname_type = []
 
     def device_func(op):
-      if op.type == "Variable":
+      if op.type in ["Variable", "VariableV2"]:
         varname_type.append((op.name, op.get_attr("dtype")))
       return "/gpu:0"
 
@@ -672,6 +688,27 @@ def axis0_into3_partitioner(shape=None, **unused_kwargs):
 
 class VariableScopeWithPartitioningTest(tf.test.TestCase):
 
+  def testInitFromNonInitializer(self):
+    with self.test_session() as sess:
+      # Test various dtypes with zeros initializer as following:
+      types = [tf.int8, tf.uint8, tf.int16, tf.uint16, tf.int32, tf.int64, 
+              tf.bool]
+
+      # Use different varibale_name to distinguish various dtypes
+      for (i, dtype) in enumerate(types):
+        x = tf.get_variable(name='x%d' % i, shape=(3, 4), dtype=dtype,
+            partitioner=axis0_into2_partitioner)
+        y = tf.get_variable(name='y%d' % i, dtype=dtype, 
+            partitioner=axis0_into2_partitioner,
+            initializer=init_ops.zeros_initializer(shape=(6, 4), dtype=dtype))
+
+        tf.global_variables_initializer().run()
+        # x and y would become var list after partition
+        val_x = sess.run(list(x))
+        val_y = sess.run(list(y))
+
+        self.assertAllEqual(val_x, val_y)
+
   def testResultNameMatchesRequested(self):
     with tf.variable_scope("scope0", partitioner=axis0_into2_partitioner):
       v = tf.get_variable("name0", shape=(3, 1, 1))
@@ -679,9 +716,9 @@ class VariableScopeWithPartitioningTest(tf.test.TestCase):
       v_concat = v.as_tensor()
       self.assertEqual(v_concat.name, "scope0/name0:0")
       variables = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES)
-      self.assertTrue("scope0/name0/part_0:0" in [x.name for x in variables])
-      self.assertTrue("scope0/name0/part_1:0" in [x.name for x in variables])
-      self.assertFalse("scope0/name0/part_2:0" in [x.name for x in variables])
+      self.assertIn("scope0/name0/part_0:0", [x.name for x in variables])
+      self.assertIn("scope0/name0/part_1:0", [x.name for x in variables])
+      self.assertNotIn("scope0/name0/part_2:0", [x.name for x in variables])
 
   def testBreaksIfPartitioningChanges(self):
     with tf.variable_scope("scope0", partitioner=axis0_into2_partitioner):
@@ -724,6 +761,13 @@ class VariableScopeWithPartitioningTest(tf.test.TestCase):
       self.assertEqual(axis0_into2_partitioner, vs.partitioner)
       with tf.variable_scope(vs) as vs1:
         self.assertEqual(axis0_into2_partitioner, vs1.partitioner)
+
+  def testScalarIgnoresPartitioner(self):
+    with tf.variable_scope("scope0", partitioner=axis0_into2_partitioner):
+      v = tf.get_variable("name0", shape=())
+      self.assertEqual(v.name, "scope0/name0:0")
+      variables = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES)
+      self.assertIn("scope0/name0:0", [x.name for x in variables])
 
   def testPartitionConcatenatesAlongCorrectAxis(self):
     def _part_axis_0(**unused_kwargs):

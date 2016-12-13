@@ -112,12 +112,10 @@ class ForestHParams(object):
     # regression and avoids having to recompute sums for classification.
     self.num_output_columns = self.num_classes + 1
 
-    # The Random Forest literature recommends sqrt(# features) for
-    # classification problems, and p/3 for regression problems.
-    # TODO(thomaswc): Consider capping this for large number of features.
-    self.num_splits_to_consider = (
-        self.num_splits_to_consider or
-        max(10, int(math.ceil(math.sqrt(self.num_features)))))
+    # Our experiments have found that num_splits_to_consider = num_features
+    # gives good accuracy.
+    self.num_splits_to_consider = self.num_splits_to_consider or min(
+        self.num_features, 1000)
 
     self.max_fertile_nodes = (self.max_fertile_nodes or
                               int(math.ceil(self.max_nodes / 2.0)))
@@ -337,8 +335,8 @@ class RandomForestGraphs(object):
 
   def _bag_features(self, tree_num, input_data):
     split_data = array_ops.split(1, self.params.num_features, input_data)
-    return array_ops.concat(
-        1, [split_data[ind] for ind in self.params.bagged_features[tree_num]])
+    return array_ops.concat_v2(
+        [split_data[ind] for ind in self.params.bagged_features[tree_num]], 1)
 
   def training_graph(self,
                      input_data,
@@ -371,7 +369,8 @@ class RandomForestGraphs(object):
         if self.params.bagging_fraction < 1.0:
           # TODO(thomaswc): This does sampling without replacment.  Consider
           # also allowing sampling with replacement as an option.
-          batch_size = array_ops.slice(array_ops.shape(input_data), [0], [1])
+          batch_size = array_ops.strided_slice(
+              array_ops.shape(input_data), [0], [1])
           r = random_ops.random_uniform(batch_size, seed=seed)
           mask = math_ops.less(
               r, array_ops.ones_like(r) * self.params.bagging_fraction)
@@ -537,9 +536,10 @@ class RandomTreeGraphs(object):
       return control_flow_ops.no_op()
 
     return control_flow_ops.cond(
-        math_ops.equal(array_ops.squeeze(array_ops.slice(
-            self.variables.tree, [0, 0], [1, 1])), -2),
-        _init_tree, _nothing)
+        math_ops.equal(
+            array_ops.squeeze(
+                array_ops.strided_slice(self.variables.tree, [0, 0], [1, 1])),
+            -2), _init_tree, _nothing)
 
   def _gini(self, class_counts):
     """Calculate the Gini impurity.
@@ -633,7 +633,7 @@ class RandomTreeGraphs(object):
     if isinstance(input_data, sparse_tensor.SparseTensor):
       sparse_indices = input_data.indices
       sparse_values = input_data.values
-      sparse_shape = input_data.shape
+      sparse_shape = input_data.dense_shape
       input_data = []
 
     # Count extremely random stats.
@@ -808,8 +808,8 @@ class RandomTreeGraphs(object):
         state_ops.scatter_update(self.variables.accumulator_to_node_map,
                                  a2n_map_updates[0], a2n_map_updates[1]))
 
-    cleared_and_allocated_accumulators = array_ops.concat(
-        0, [accumulators_cleared, accumulators_allocated])
+    cleared_and_allocated_accumulators = array_ops.concat_v2(
+        [accumulators_cleared, accumulators_allocated], 0)
 
     # Calculate values to put into scatter update for candidate counts.
     # Candidate split counts are always reset back to 0 for both cleared
@@ -839,7 +839,7 @@ class RandomTreeGraphs(object):
             array_ops.zeros_like(accumulators_allocated,
                                  dtype=dtypes.float32), 1),
         [1, self.params.num_output_columns])
-    accumulator_updates = array_ops.concat(0, [total_cleared, total_reset])
+    accumulator_updates = array_ops.concat_v2([total_cleared, total_reset], 0)
     updates.append(state_ops.scatter_update(
         self.variables.accumulator_sums,
         cleared_and_allocated_accumulators, accumulator_updates))
@@ -890,7 +890,7 @@ class RandomTreeGraphs(object):
     if isinstance(input_data, sparse_tensor.SparseTensor):
       sparse_indices = input_data.indices
       sparse_values = input_data.values
-      sparse_shape = input_data.shape
+      sparse_shape = input_data.dense_shape
       input_data = []
     return self.inference_ops.tree_predictions(
         input_data, sparse_indices, sparse_values, sparse_shape, data_spec,

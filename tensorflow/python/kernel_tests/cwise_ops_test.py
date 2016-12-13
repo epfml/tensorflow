@@ -59,7 +59,7 @@ def _sparsify(x, thresh=0.5, index_dtype=np.int64):
   x_shape = x.shape
 
   return tf.SparseTensor(
-      indices=x_indices, values=x_values, shape=x_shape), x_values
+      indices=x_indices, values=x_values, dense_shape=x_shape), x_values
 
 class UnaryOpTest(tf.test.TestCase):
 
@@ -120,7 +120,8 @@ class UnaryOpTest(tf.test.TestCase):
     self.assertTrue(isinstance(result_tensor, tf.SparseTensor))
     self.assertTrue(isinstance(input_sp_t, tf.SparseTensor))
     self.assertAllEqual(input_sp_t.indices.eval(), result_tensor.indices.eval())
-    self.assertAllEqual(input_sp_t.shape.eval(), result_tensor.shape.eval())
+    self.assertAllEqual(
+        input_sp_t.dense_shape.eval(), result_tensor.dense_shape.eval())
     if tol is None:
       self.assertAllClose(result_np, result_tensor.values.eval())
     else:
@@ -1913,7 +1914,7 @@ class ComplexMakeRealImagTest(tf.test.TestCase):
     # gradient function is checked.
     with self.test_session():
       inx = tf.convert_to_tensor(x)
-      real, imag = tf.split(1, 2, inx)
+      real, imag = tf.split(value=inx, num_or_size_splits=2, axis=1)
       real, imag = tf.reshape(real, [-1]), tf.reshape(imag, [-1])
       cplx = tf.complex(real, imag)
       cplx = tf.conj(cplx)
@@ -1958,7 +1959,7 @@ class ComplexMakeRealImagTest(tf.test.TestCase):
     # x, real parts of y and imaginary parts of y.
     with self.test_session():
       inp = tf.convert_to_tensor(data)
-      xr, xi, yr, yi = tf.split(1, 4, inp)
+      xr, xi, yr, yi = tf.split(value=inp, num_or_size_splits=4, axis=1)
 
       def vec(x):  # Reshape to a vector
         return tf.reshape(x, [-1])

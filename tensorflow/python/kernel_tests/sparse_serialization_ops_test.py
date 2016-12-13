@@ -123,11 +123,11 @@ class SerializeSparseTest(tf.test.TestCase):
           [serialized, deserialized],
           feed_dict={sparse_tensor.indices: indices_value,
                      sparse_tensor.values: values_value,
-                     sparse_tensor.shape: shape_value})
+                     sparse_tensor.dense_shape: shape_value})
       self.assertEqual(serialized_value.shape, (4, 3))
       self.assertAllEqual(deserialized_value.indices, indices_value)
       self.assertAllEqual(deserialized_value.values, values_value)
-      self.assertAllEqual(deserialized_value.shape, shape_value)
+      self.assertAllEqual(deserialized_value.dense_shape, shape_value)
 
   def testDeserializeFailsWrongType(self):
     with self.test_session(use_gpu=False) as sess:
