@@ -88,6 +88,7 @@ tensorflow/core/kernels/maxpooling_op.cc
 tensorflow/core/kernels/matmul_op.cc
 tensorflow/core/kernels/lrn_op.cc
 tensorflow/core/kernels/logging_ops.cc
+tensorflow/core/kernels/inplace_ops.cc
 tensorflow/core/kernels/in_topk_op.cc
 tensorflow/core/kernels/immutable_constant_op.cc
 tensorflow/core/kernels/identity_op.cc
@@ -106,6 +107,7 @@ tensorflow/core/kernels/deep_conv2d.cc
 tensorflow/core/kernels/xsmm_conv2d.cc
 tensorflow/core/kernels/cwise_ops_common.cc
 tensorflow/core/kernels/cwise_op_tanh.cc
+tensorflow/core/kernels/cwise_op_pow.cc
 tensorflow/core/kernels/cwise_op_sub.cc
 tensorflow/core/kernels/cwise_op_squared_difference.cc
 tensorflow/core/kernels/cwise_op_square.cc
