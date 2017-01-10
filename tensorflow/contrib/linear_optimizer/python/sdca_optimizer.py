@@ -57,6 +57,9 @@ class SDCAOptimizer(object):
   running the train steps. It defaults to 1 (single machine). num_table_shards
   defines the number of shards for the internal state table, typically set to
   match the number of parameter servers for large data sets.
+
+  Note that we have added a new version of SDCA Optimizer. Choose new optimizer
+  by setting `dual_method` to be true.
   """
 
   def __init__(self,
@@ -64,12 +67,14 @@ class SDCAOptimizer(object):
                num_loss_partitions=1,
                num_table_shards=None,
                symmetric_l1_regularization=0.0,
-               symmetric_l2_regularization=1.0):
+               symmetric_l2_regularization=1.0,
+               dual_method=False):
     self._example_id_column = example_id_column
     self._num_loss_partitions = num_loss_partitions
     self._num_table_shards = num_table_shards
     self._symmetric_l1_regularization = symmetric_l1_regularization
     self._symmetric_l2_regularization = symmetric_l2_regularization
+    self._dual_method = dual_method
 
   def get_name(self):
     return 'SDCAOptimizer'
@@ -78,7 +83,15 @@ class SDCAOptimizer(object):
                      weight_column_name, loss_type, features, targets,
                      global_step):
     """Returns the training operation of an SdcaModel optimizer."""
+    
+    # The input `features` maps FeatureColumn instance to the
+    # corresponding tensor. 
 
+    # Unlike dense features, which is easy to represent, the sparse features
+    # have many forms (_BucketizedColumn, _SparseColumn,...). In order to deal
+    # with these sparse columns uniformly, a class `SparseFeatureColumn` is
+    # defined to represent one feature group.
+    
     def _tensor_to_sparse_feature_column(dense_tensor):
       """Returns SparseFeatureColumn for the input dense_tensor."""
       ignore_value = 0.0
@@ -168,6 +181,13 @@ class SDCAOptimizer(object):
           features[weight_column_name],
           shape=[-1]) if weight_column_name else array_ops.ones([batch_size])
       example_ids = features[self._example_id_column]
+
+      # Here we use `extend` so that sparse feature with values will be
+      # the first few items. This assumption is used in the implementation of
+      # sdca_internal.cc. When initializing the sparse features, we will check
+      # if the index of a `feature group` exceeds the number of
+      # `sparse_feature_with_values`. If it exceeds, we will also include the
+      # sparse values. 
       sparse_feature_with_values.extend(sparse_features)
       sparse_feature_with_values_weights.extend(sparse_feature_weights)
       examples = dict(sparse_features=sparse_feature_with_values,
@@ -190,6 +210,7 @@ class SDCAOptimizer(object):
             symmetric_l2_regularization=self._symmetric_l2_regularization,
             num_loss_partitions=self._num_loss_partitions,
             num_table_shards=self._num_table_shards,
-            loss_type=loss_type))
+            loss_type=loss_type,
+            dual_method=self._dual_method))
     train_op = sdca_model.minimize(global_step=global_step)
     return sdca_model, train_op

@@ -214,6 +214,12 @@ def sdca_model_fn(features, labels, mode, params):
 
   with variable_scope.variable_op_scope(
       features.values(), parent_scope) as scope:
+
+    # The `features` here are implicitly modified. Before this operation, the 
+    # `features` can be a dict of str (feature name) to tensor. After
+    # `weighted_sum_from_feature_columns`, instances of FeatureColumn are also
+    # added as a key to the tensor. As a result, the `get_train_step` use this 
+    # fact.
     logits, columns_to_variables, bias = (
         layers.weighted_sum_from_feature_columns(
             columns_to_tensors=features,

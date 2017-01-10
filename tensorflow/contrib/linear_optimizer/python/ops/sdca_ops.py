@@ -38,6 +38,21 @@ from tensorflow.python.summary import summary
 
 __all__ = ['SdcaModel']
 
+# TODO: example_state_data returned by gen_sdca_ops contains v in its first 
+# column. This v will be collected to parameter server and wait for it to send
+# back the aggregated v. 
+# 
+# This step is slimilar to `SyncReplicaOptimizer`. When constructing graphs, 
+# each replica will register an operation in accumulator in parameter server.
+# This is done by using the device of variable.
+# 
+# We also register an update operator on the device where global variable 
+# is located. When the tokens are all dequeued, the v from each replicas will be 
+# aggregated. Before next batch, v will be updated.
+# 
+# At the same time, there is a queue runner in chief worker which constantly 
+# ask for aggregated v. 
+
 
 # TODO(sibyl-Aix6ihai): add name_scope to appropriate methods.
 class SdcaModel(object):
@@ -147,6 +162,7 @@ class SdcaModel(object):
         key_dtype=dtypes.int64,
         value_dtype=dtypes.float32,
         num_shards=self._num_table_shards(),
+        # Default values of elements of `example_state_data` in `minimize`
         default_value=[0.0, 0.0, 0.0, 0.0],
         # SdcaFprint never returns 0 or 1 for the low64 bits, so this a safe
         # empty_key (that will never collide with actual payloads).
@@ -311,9 +327,8 @@ class SdcaModel(object):
           internal_convert_to_tensor(self._examples['example_ids']))
       # pylint: enable=protected-access
       example_state_data = self._hashtable.lookup(example_ids_hashed)
-      # Solver returns example_state_update, new delta sparse_feature_weights
-      # and delta dense_feature_weights.
 
+      # Convert internal weight variables to tensor.
       weights_tensor = self._convert_n_to_tensor(self._slots[
           'unshrinked_sparse_features_weights'])
       sparse_weights = []
@@ -323,11 +338,16 @@ class SdcaModel(object):
         with ops.device(w.device):
           sparse_indices.append(
               math_ops.cast(
+                  # array_ops.unique returns a tuple (unique_value, value_index)
+                  # here only the value of `math_ops.cast(i, dtypes.int32)` is 
+                  # our concern.
                   array_ops.unique(math_ops.cast(i, dtypes.int32))[0],
                   dtypes.int64))
           sparse_weights.append(array_ops.gather(w, sparse_indices[-1]))
 
       # pylint: disable=protected-access
+      # Solver returns example_state_update, new delta sparse_feature_weights
+      # and delta dense_feature_weights.
       esu, sfw, dfw = gen_sdca_ops._sdca_optimizer(
           sparse_example_indices,
           sparse_feature_indices,
@@ -335,8 +355,11 @@ class SdcaModel(object):
           self._convert_n_to_tensor(self._examples['dense_features']),
           internal_convert_to_tensor(self._examples['example_weights']),
           internal_convert_to_tensor(self._examples['example_labels']),
+          # Sparse weights indices
           sparse_indices,
+          # Sparse weights
           sparse_weights,
+          # Dense weights
           self._convert_n_to_tensor(self._slots[
               'unshrinked_dense_features_weights']),
           example_state_data,
@@ -344,9 +367,11 @@ class SdcaModel(object):
           l1=self._options['symmetric_l1_regularization'],
           l2=self._symmetric_l2_regularization(),
           num_loss_partitions=self._num_loss_partitions(),
-          num_inner_iterations=1)
+          num_inner_iterations=1,
+          dual_method=self._options['dual_method'])
       # pylint: enable=protected-access
 
+      # update nominal weights with delta weights obtained from sfw/dfw.
       with ops.control_dependencies([esu]):
         update_ops = [self._hashtable.insert(example_ids_hashed, esu)]
         # Update the weights before the proximal step.
@@ -381,6 +406,10 @@ class SdcaModel(object):
         for var, slot_var in zip(self._variables[name],
                                  self._slots['unshrinked_' + name]):
           update_ops.append(var.assign(slot_var))
+
+    # We don't need to apply shrinkage to weight for lasso solver.
+    if self._options['dual_method']:
+      return control_flow_ops.group(*update_ops)
 
     # Apply proximal step.
     with ops.control_dependencies(update_ops):

@@ -24,6 +24,7 @@ limitations under the License.
 #include <new>
 #include <string>
 #include <vector>
+#include <chrono>
 
 #include "third_party/eigen3/unsupported/Eigen/CXX11/Tensor"
 #include "tensorflow/core/framework/device_base.h"
@@ -80,6 +81,8 @@ struct ComputeOptions {
                                       "Unsupported loss type: ", loss_type));
     }
     OP_REQUIRES_OK(context, context->GetAttr("adaptative", &adaptative));
+    OP_REQUIRES_OK(context, context->GetAttr("dual_method", &dual_method));
+
     OP_REQUIRES_OK(
         context, context->GetAttr("num_sparse_features", &num_sparse_features));
     OP_REQUIRES_OK(context, context->GetAttr("num_sparse_features_with_values",
@@ -112,6 +115,7 @@ struct ComputeOptions {
   int num_inner_iterations = 0;
   int num_loss_partitions = 0;
   bool adaptative = false;
+  bool dual_method  = false;
   Regularizations regularizations;
 };
 
@@ -217,6 +221,257 @@ void DoCompute(const ComputeOptions& options, OpKernelContext* const context) {
   OP_REQUIRES_OK(context, train_step_status);
 }
 
+//////////////////////////////////////////////////////////////////////////////
+// Compute the soft threshold for this function
+double SoftThreshold(const double alpha, const double gamma){
+  double shrink = std::max(std::abs(alpha) - gamma, 0.0);
+  return std::copysign(shrink, alpha);
+}
+
+// TODO: Add Primal-Dual Certificates.
+// See Primal-Dual Rates and Certificates (2016) formula (18)
+//    G(\alpha) = <w, A\alpha> + B[||A^Tw||_\infty-\lambda]_+ + \lambda||\alpha||_1
+// Compute the duality gap for L1_regularized Problem.
+// float ComputeL1DualityGap(const ModelWeights& model_weights, const Examples& examples,
+//   const ComputeOptions& options){
+
+//   // Part: \lambda||\alpha||_1
+//   float l1 = options.regularizations.symmetric_l1();
+//   float l1_regularized = l1 * model_weights.l1_norm();
+
+//   // B = 1/\lambda f(0) = 1/(2\lambda) ||b||_2^2
+//   float B = 0;
+//   for (int i = 0; i < examples.num_examples(); ++i){
+//     B += std::pow(examples.example(i).example_label(), 2);
+//   }
+//   B = B/(2*l1); 
+
+//   // <w, A\alpha>
+//   float w_A_alpha = 0;
+//   for (size_t i = 0; i < examples.num_examples(); ++i){
+//     const ExampleStatistics example_statistics =
+//     examples.example(i).ComputeWxAndWeightedExampleNorm(
+//         options.num_loss_partitions, model_weights,
+//         options.regularizations, 1 /* num_weight_vectors */);
+
+//     w_A_alpha += example_statistics.wx[0] * examples.weight(i);
+//   }
+
+//   float max_At_w = std::numeric_limits<float>::min();
+//   for (int i = 0; i < examples.num_features(); ++i){
+//     auto Ai = examples.Ai(i);
+//     auto w  = examples.WAsCol();
+//     // float sn =0;
+//     // sn() = (Ai * w).sum();
+//     Eigen::Tensor<float, 0, Eigen::RowMajor> sn = (Ai * w).sum();
+//     max_At_w = std::max(std::abs(sn()), max_At_w);
+//   }
+
+//   return w_A_alpha + B * std::max(max_At_w - l1, static_cast<float>(0)) + l1_regularized;
+// }
+
+// TODO(shengx): The helper classes/methods are changed to support multiclass
+// SDCA, which lead to changes within this function. Need to revisit the
+// convergence once the multiclass SDCA is in.
+// TODO: Add `example_weight` back.
+void DoComputeDual(const ComputeOptions& options, OpKernelContext* const context){
+  ModelWeights model_weights;
+  OP_REQUIRES_OK(context, model_weights.Initialize(context));
+
+  Examples examples;
+  OP_REQUIRES_OK(
+      context,
+      examples.Initialize(context, model_weights, options.num_sparse_features,
+                          options.num_sparse_features_with_values,
+                          options.num_dense_features));
+
+  const Tensor* example_state_data_t;
+  OP_REQUIRES_OK(context,
+                 context->input("example_state_data", &example_state_data_t));
+  TensorShape expected_example_state_shape({examples.num_examples(), 4});
+  OP_REQUIRES(context,
+              example_state_data_t->shape() == expected_example_state_shape,
+              errors::InvalidArgument(
+                  "Expected shape ", expected_example_state_shape.DebugString(),
+                  " for example_state_data, got ",
+                  example_state_data_t->shape().DebugString()));
+
+  Tensor mutable_example_state_data_t(*example_state_data_t);
+  auto example_state_data = mutable_example_state_data_t.matrix<float>();
+  context->set_output("out_example_state_data", mutable_example_state_data_t);
+
+  if (options.adaptative) {
+    OP_REQUIRES_OK(context,
+                   examples.SampleAdaptativeProbabilities(
+                       options.num_loss_partitions, options.regularizations,
+                       model_weights, example_state_data, options.loss_updater,
+                       /*num_weight_vectors =*/1));
+  }
+
+  //////////////////////////////////////////////////////////////////////////////
+  int num_examples = examples.num_examples();
+  auto v = example_state_data.slice(
+    Eigen::array<int, 2>({0,0}), Eigen::array<int, 2>({num_examples, 1}));
+
+  // Compute 
+  //              <A_k, r>
+  // where r = b - A\alpha = b - v is residual.
+  auto dense_feature_dot_residual = [&](int k){
+    const Eigen::Tensor<float, 0, Eigen::RowMajor> sn = 
+        (examples.DeanseFeatureAsMatrix(k) * (examples.labels() - v)).sum();
+    return sn();
+  };
+
+  mutex mu;
+  Status train_step_status GUARDED_BY(mu);
+  std::atomic<std::int64_t> atomic_index(-1);
+
+  // TODO: For the moment, the loss function is fixed to be squared norm.
+  // 
+  // The minimization objective is:
+  //    min D(\alpha) = 1/2 || b - A\alpha||_2^2 + \lambda_1 ||\alpha||_1
+  // Apply coordinate descent to \alpha_i, the updated \alpha_i is given by 
+  // proximal operator (soft-thresholding for squared norm):
+  //    \alpha_i = S_{\lambda/||A_i||^2}(\frac{A_i^Tr}{||A_i||^2}+\alpha_i^{\text{old}})
+  // where soft-thresholding is defined as 
+  //    S_{\gamma}(g)=\text{sgn}(g) (|g|-\gamma)_+
+  auto train_step_dense = [&](const int64 begin, const int64 end) {
+    // The static_cast here is safe since begin and end can be at most
+    // num_examples which is an int.
+    for (int id = static_cast<int>(begin); id < end; ++id) {
+      std::cout << "\033[1;31m" << "train_step_dense = " << id  << "\033[0m" << std::endl;
+      float ai_squared = examples.DenseFeatureSquaredNorm(id);
+
+      // In case A_i is a vector of 0s, than the corresponding \alpha_i is 0 and 
+      // don't update.
+      if (std::abs(ai_squared) < 10e-10){
+        continue;
+      }
+
+      float ai_dot_residual = dense_feature_dot_residual(id);
+      std::cout << "ai_dot_residual = " << ai_dot_residual << std::endl;
+      std::cout << "ai_squared = " << ai_squared << std::endl;
+
+      // TODO: use alpha implicitly as alpha can be dense and sparse. While the 
+      // primal in this case can be float.
+      float alpha = model_weights.dense_weights()[id].weight();
+      std::cout << "alpha = " << alpha << std::endl;
+      float candidate = ai_dot_residual/ai_squared + alpha;
+      std::cout << "candidate = " << candidate << std::endl;
+
+      float new_alpha = SoftThreshold(candidate, 
+        options.regularizations.symmetric_l1()/ai_squared);
+      std::cout << "compute new alpha" << new_alpha << std::endl;
+
+      model_weights.UpdateDenseDeltaWeights(
+          context->eigen_cpu_device(), new_alpha - alpha, id);
+
+      // Primal weight is 
+      //    W = \nabla f(A\alpha) = A\alpha - b
+      // Thus we update it with
+      //    \Delta W = A_k \Delta\alpha_k
+      // We use V = W - b, so that use example_state_data to store v, initially 
+      //    \alpha = 0, V = 0
+      v += examples.DeanseFeatureAsMatrix(id) * v.constant(new_alpha - alpha);
+    }
+  };
+
+  // TODO(sibyl-Aix6ihai): Tune this properly based on sparsity of the data,
+  // number of cpus, and cost per example.
+
+  const int64 kCostPerUnit = examples.num_examples();
+  const DeviceBase::CpuWorkerThreads& worker_threads =
+      *context->device()->tensorflow_cpu_worker_threads();
+
+  // Updating dense features
+  Shard(worker_threads.num_threads, worker_threads.workers,
+        options.num_dense_features, kCostPerUnit, train_step_dense);
+
+  example_state_data.slice(
+    Eigen::array<int, 2>({0,0}), Eigen::array<int, 2>({num_examples, 1})) = v;
+
+
+  auto sparse_feature_dot_residual = [&](int sf_indices, int indices){
+    float sum = 0;
+    for (int example_id = 0; example_id < num_examples; ++example_id){
+      // Find the feature in the sparse feature group 
+      const Example& example = examples.example(example_id);
+      float sv = example.sparse_value(sf_indices, indices);
+      // TODO: make `example_state_data` and `v` more consistent.
+      sum += (examples.labels()(example_id, 0) - example_state_data(example_id, 0)) * sv ;
+    }
+    return sum;
+  };
+
+  // Update sparse features
+  auto train_step_sparse = [&](const int64 begin, const int64 end) {
+    // The static_cast here is safe since begin and end can be at most
+    // num_examples which is an int.
+    // TODO: change `sf_indices` to a better name
+    for (int sf_indices = static_cast<int>(begin); sf_indices < end; ++sf_indices) {
+      // TODO: Don't use FeatureWeightsSparseStorage directly here.
+      const sdca::FeatureWeightsSparseStorage& sparse_weights =
+          model_weights.sparse_weights()[sf_indices];
+      std::cout << "\033[1;31m" << "train_step_sparse = " << sf_indices  << "\033[0m" << std::endl;
+
+      // For each feature in this sparse feature column, train one step.
+      for (int64 id = 0; id < sparse_weights.num_ids(); ++id){
+        int64 indices = sparse_weights.id_to_indices(id);
+        float ai_squared = examples.SparseFeatureSquaredNorm(sf_indices, indices);
+        // std::cout << "indices = " << indices << std::endl;
+        std::cout << "ai_squared = " << ai_squared << std::endl;
+        
+        float ai_dot_residual = sparse_feature_dot_residual(sf_indices, indices);
+        std::cout << "ai_dot_residual = " << ai_dot_residual << std::endl;
+
+        if (std::abs(ai_squared) < 10e-10){
+          // If this featuer is almost 0, then we don't do the proximal step.
+          continue;
+        }
+
+        // TODO: use alpha implicitly as alpha can be dense and sparse. While the 
+        // primal in this case can be float.
+        // TODO: Add support for num_loss_
+        float alpha = sparse_weights.nominals_by_id(0, id) 
+                   + sparse_weights.deltas_by_id(0, id);
+
+        // std::cout << "alpha = " << alpha << std::endl;
+        
+        float candidate = ai_dot_residual/ai_squared + alpha;
+        // std::cout << "candidate = " << candidate << std::endl;
+
+        float new_alpha = SoftThreshold(candidate, 
+          options.regularizations.symmetric_l1()/ai_squared);
+        // std::cout << "new alpha = " << new_alpha << std::endl;
+        
+        model_weights.UpdateSparseDeltaWeights(
+            context->eigen_cpu_device(), new_alpha - alpha, sf_indices, indices);
+
+        // Update v by 
+        //        \Delta v = A_i * \Delta\alpha
+        for (int example_id = 0; example_id < num_examples; ++example_id){
+          // Find the feature in the sparse feature group 
+          const Example& example = examples.example(example_id);
+          // TODO: (Prefixed) define `indices` in a suitable way.
+          float sv = example.sparse_value(sf_indices, indices);
+
+          example_state_data(example_id, 0) += sv * (new_alpha - alpha);
+        }
+        // std::cout << "v has been updated" << std::endl;
+      } // Loop of indices in a column.s
+
+    }
+  };
+
+
+  Shard(worker_threads.num_threads, worker_threads.workers,
+        options.num_sparse_features, kCostPerUnit, train_step_sparse);
+
+  // std::cout << "Duality Gap = " << ComputeL1DualityGap(model_weights, examples, options)
+  //           << std::endl;
+  OP_REQUIRES_OK(context, train_step_status);
+}
+
 }  // namespace
 
 class SdcaOptimizer : public OpKernel {
@@ -225,7 +480,19 @@ class SdcaOptimizer : public OpKernel {
       : OpKernel(context), options_(context) {}
 
   void Compute(OpKernelContext* context) override {
-    DoCompute(options_, context);
+    // The input attribute 'dual_method' specifies the method to be used. 
+    // If it is false, we use primal solver. Otherwise, we use dual method.
+    
+    auto t1 = std::chrono::high_resolution_clock::now();
+    if (!options_.dual_method){
+      DoCompute(options_, context);
+    } else {
+      DoComputeDual(options_, context);
+    }
+    auto t2 = std::chrono::high_resolution_clock::now();
+    std::cout << "Compute took "
+              << std::chrono::duration_cast<std::chrono::milliseconds>(t2-t1).count()
+              << " milliseconds\n";    
   }
 
  private:

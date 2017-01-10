@@ -115,9 +115,13 @@ Status ModelWeights::Initialize(OpKernelContext* const context) {
     auto deltas = delta_t->shaped<float, 2>({1, delta_t->NumElements()});
     deltas.setZero();
     sparse_weights_.emplace_back(FeatureWeightsSparseStorage{
+        // Sparse weight indices
         sparse_indices_inputs[i].flat<int64>(),
+        // Nominal value of weight : either initial value or the weight before
+        // this training step
         sparse_weights_inputs[i].shaped<float, 2>(
             {1, sparse_weights_inputs[i].NumElements()}),
+        // Initialize deltas as 0 before this training step
         deltas});
   }
 
@@ -317,6 +321,7 @@ Status Examples::Initialize(OpKernelContext* const context,
   OpInputList sparse_feature_indices_inputs;
   TF_RETURN_IF_ERROR(context->input_list("sparse_feature_indices",
                                          &sparse_feature_indices_inputs));
+
   OpInputList sparse_feature_values_inputs;
   if (num_sparse_features_with_values > 0) {
     TF_RETURN_IF_ERROR(context->input_list("sparse_feature_values",
@@ -355,6 +360,13 @@ Status Examples::Initialize(OpKernelContext* const context,
     example->example_weight_ = example_weights(example_id);
     example->example_label_ = example_labels(example_id);
   }
+
+  // TODO: Add a test of input labels.
+  // Convert the label 0/1 to -1/+1.
+  TTypes<float>::ConstMatrix m(example_labels.data(), num_examples, 1);
+  labels_.reset(new Eigen::Tensor<float, 2, Eigen::RowMajor>(m));
+  (*labels_) = (*labels_) * (*labels_).constant(2) - (*labels_).constant(1);
+
   const DeviceBase::CpuWorkerThreads& worker_threads =
       *context->device()->tensorflow_cpu_worker_threads();
   TF_RETURN_IF_ERROR(CreateSparseFeatureRepresentation(
@@ -404,6 +416,9 @@ Status Examples::CreateSparseFeatureRepresentation(
             example_indices(start_id) == example_id) {
           sparse_features->indices.reset(new UnalignedInt64Vector(
               &(feature_indices(start_id)), end_id - start_id));
+
+          // The first (sparse_feature_values_inputs.size()) features groups
+          // have values according to the implementation of `SDCAOptimizer`
           if (sparse_feature_values_inputs.size() > i) {
             auto feature_weights =
                 sparse_feature_values_inputs[i].flat<float>();
@@ -518,6 +533,68 @@ void Examples::ComputeSquaredNormPerExample(
   Shard(worker_threads.num_threads, worker_threads.workers, num_examples,
         kCostPerUnit, compute_example_norm);
 }
+//////////////////////////////////////////////////////////////////////////////
+
+// TODO: Change exmples_[0] to corresponding features
+float Examples::DenseFeatureSquaredNorm(int i) const{
+  auto Ai = examples_[0].dense_vectors()[i]->Col();
+  const Eigen::Tensor<float, 0, Eigen::RowMajor> sn = Ai.square().sum();
+  return sn();
+}
+
+// Compute the squred norm of a sparse feature column of a feature group.
+// For the moment, we didn't take advantage of the sparsity.
+float Examples::SparseFeatureSquaredNorm(int sf_index, int64 indices) const{
+  float sum = 0;
+  for (int example_id = 0; example_id < examples_.size(); ++example_id){
+    const Example::SparseFeatures& sparse_features = examples_[example_id].sparse_features_[sf_index];
+    // if the given `indices` is in this part.
+    const float feature_value = sparse_features.query_value(indices);
+    sum += feature_value * feature_value;      
+  }
+  return sum;
+}
+
+void ModelWeights::UpdateDenseDeltaWeights(
+    const Eigen::ThreadPoolDevice& device,
+    const float delta_alpha, int i){
+  dense_weights_[i].UpdateDenseDeltaWeights(device, delta_alpha);
+}
+
+void ModelWeights::UpdateSparseDeltaWeights(
+    const Eigen::ThreadPoolDevice& device,
+    const float delta_alpha, int sf_id, int sf_indices){
+  sparse_weights_[sf_id].UpdateSparseDeltaWeights(device,
+    sf_indices, delta_alpha);
+}
+
+void FeatureWeightsDenseStorage::UpdateDenseDeltaWeights(
+    const Eigen::ThreadPoolDevice& device, double delta_alpha){
+  deltas_.device(device) =
+        deltas_ + deltas_.constant(delta_alpha);
+}
+
+void FeatureWeightsSparseStorage::UpdateSparseDeltaWeights(
+    const Eigen::ThreadPoolDevice& device,
+    const int64 sf_indices,
+    const double delta_alpha) {
+  // TODO: For the memoent this kernel only supports binary classification. 
+  // When multi-class classification is available, change `delta_alpha` to a
+  // vector.
+  // TODO: use the fact that sparse delta weight is zero.
+  auto it = indices_to_id_.find(sf_indices);
+  deltas_(0, it->second) += delta_alpha;
+}
+
+float ModelWeights::l1_norm() const {
+  float sum = 0;
+  for (size_t i = 0; i < dense_weights_.size(); ++i){
+    sum += std::abs(dense_weights_[i].weight());
+  }
+  return sum;
+}
+
+//////////////////////////////////////////////////////////////////////////////
 
 }  // namespace sdca
 
