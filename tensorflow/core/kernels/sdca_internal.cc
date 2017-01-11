@@ -361,8 +361,7 @@ Status Examples::Initialize(OpKernelContext* const context,
     example->example_label_ = example_labels(example_id);
   }
 
-  // TODO: Add a test of input labels.
-  // Convert the label 0/1 to -1/+1.
+  // Convert the label 0/1 to -1/+1 for dual optimizer.
   TTypes<float>::ConstMatrix m(example_labels.data(), num_examples, 1);
   labels_.reset(new Eigen::Tensor<float, 2, Eigen::RowMajor>(m));
   (*labels_) = (*labels_) * (*labels_).constant(2) - (*labels_).constant(1);
@@ -533,26 +532,11 @@ void Examples::ComputeSquaredNormPerExample(
   Shard(worker_threads.num_threads, worker_threads.workers, num_examples,
         kCostPerUnit, compute_example_norm);
 }
-//////////////////////////////////////////////////////////////////////////////
 
-// TODO: Change exmples_[0] to corresponding features
 float Examples::DenseFeatureSquaredNorm(int i) const{
   auto Ai = examples_[0].dense_vectors()[i]->Col();
   const Eigen::Tensor<float, 0, Eigen::RowMajor> sn = Ai.square().sum();
   return sn();
-}
-
-// Compute the squred norm of a sparse feature column of a feature group.
-// For the moment, we didn't take advantage of the sparsity.
-float Examples::SparseFeatureSquaredNorm(int sf_index, int64 indices) const{
-  float sum = 0;
-  for (int example_id = 0; example_id < examples_.size(); ++example_id){
-    const Example::SparseFeatures& sparse_features = examples_[example_id].sparse_features_[sf_index];
-    // if the given `indices` is in this part.
-    const float feature_value = sparse_features.query_value(indices);
-    sum += feature_value * feature_value;      
-  }
-  return sum;
 }
 
 void ModelWeights::UpdateDenseDeltaWeights(
@@ -578,23 +562,9 @@ void FeatureWeightsSparseStorage::UpdateSparseDeltaWeights(
     const Eigen::ThreadPoolDevice& device,
     const int64 sf_indices,
     const double delta_alpha) {
-  // TODO: For the memoent this kernel only supports binary classification. 
-  // When multi-class classification is available, change `delta_alpha` to a
-  // vector.
-  // TODO: use the fact that sparse delta weight is zero.
   auto it = indices_to_id_.find(sf_indices);
   deltas_(0, it->second) += delta_alpha;
 }
-
-float ModelWeights::l1_norm() const {
-  float sum = 0;
-  for (size_t i = 0; i < dense_weights_.size(); ++i){
-    sum += std::abs(dense_weights_[i].weight());
-  }
-  return sum;
-}
-
-//////////////////////////////////////////////////////////////////////////////
 
 }  // namespace sdca
 

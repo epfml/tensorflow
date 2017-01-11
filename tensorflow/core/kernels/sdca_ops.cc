@@ -274,7 +274,17 @@ double SoftThreshold(const double alpha, const double gamma){
 // SDCA, which lead to changes within this function. Need to revisit the
 // convergence once the multiclass SDCA is in.
 // TODO: Add `example_weight` back.
+// TODO: For the moment, the loss function is fixed to be squared norm.
 void DoComputeDual(const ComputeOptions& options, OpKernelContext* const context){
+  // Implement lasso solver: 
+  //  1. dual variable `\alpha` is stored in ModelWeights
+  //  2. primal weight `w = A\alpha - b` is not explictly stored. We store
+  //      `v = A\alpha`. In distributed computing, we will push local `v` and 
+  //      aggregate it in parameter server. When they are accumulated, we fetch
+  //      updates from `v` and continue to the next step.
+  //  3. Note that our code is based on the framework proxSDCA. The `features`
+  //     below actually means the columns of `A` which in fact is the example 
+  //     associated with `\alpha`.
   ModelWeights model_weights;
   OP_REQUIRES_OK(context, model_weights.Initialize(context));
 
@@ -297,6 +307,8 @@ void DoComputeDual(const ComputeOptions& options, OpKernelContext* const context
                   example_state_data_t->shape().DebugString()));
 
   Tensor mutable_example_state_data_t(*example_state_data_t);
+  // In this function only the first column of `example_state_data` will be 
+  // used. It is used for storing the intermediate variable `v =  A\alpha`.
   auto example_state_data = mutable_example_state_data_t.matrix<float>();
   context->set_output("out_example_state_data", mutable_example_state_data_t);
 
@@ -308,26 +320,24 @@ void DoComputeDual(const ComputeOptions& options, OpKernelContext* const context
                        /*num_weight_vectors =*/1));
   }
 
-  //////////////////////////////////////////////////////////////////////////////
   int num_examples = examples.num_examples();
+
+  // The slice `v` is used for dense features operation.
   auto v = example_state_data.slice(
     Eigen::array<int, 2>({0,0}), Eigen::array<int, 2>({num_examples, 1}));
 
-  // Compute 
+  // Compute dot production of a dense feature and a residual.
   //              <A_k, r>
-  // where r = b - A\alpha = b - v is residual.
+  // where r = b - A\alpha = b - v is the residual.
   auto dense_feature_dot_residual = [&](int k){
     const Eigen::Tensor<float, 0, Eigen::RowMajor> sn = 
-        (examples.DeanseFeatureAsMatrix(k) * (examples.labels() - v)).sum();
+        (examples.DenseFeatureAsMatrix(k) * (examples.labels() - v)).sum();
     return sn();
   };
 
   mutex mu;
   Status train_step_status GUARDED_BY(mu);
   std::atomic<std::int64_t> atomic_index(-1);
-
-  // TODO: For the moment, the loss function is fixed to be squared norm.
-  // 
   // The minimization objective is:
   //    min D(\alpha) = 1/2 || b - A\alpha||_2^2 + \lambda_1 ||\alpha||_1
   // Apply coordinate descent to \alpha_i, the updated \alpha_i is given by 
@@ -339,30 +349,24 @@ void DoComputeDual(const ComputeOptions& options, OpKernelContext* const context
     // The static_cast here is safe since begin and end can be at most
     // num_examples which is an int.
     for (int id = static_cast<int>(begin); id < end; ++id) {
-      std::cout << "\033[1;31m" << "train_step_dense = " << id  << "\033[0m" << std::endl;
       float ai_squared = examples.DenseFeatureSquaredNorm(id);
 
-      // In case A_i is a vector of 0s, than the corresponding \alpha_i is 0 and 
+      // In case A_i is a vector of 0s, then the corresponding \alpha_i is 0 and 
       // don't update.
       if (std::abs(ai_squared) < 10e-10){
         continue;
       }
 
+      // Compute: A_i^T*r/||A_i||^2+\alpha_i^{old}
       float ai_dot_residual = dense_feature_dot_residual(id);
-      std::cout << "ai_dot_residual = " << ai_dot_residual << std::endl;
-      std::cout << "ai_squared = " << ai_squared << std::endl;
-
-      // TODO: use alpha implicitly as alpha can be dense and sparse. While the 
-      // primal in this case can be float.
       float alpha = model_weights.dense_weights()[id].weight();
-      std::cout << "alpha = " << alpha << std::endl;
       float candidate = ai_dot_residual/ai_squared + alpha;
-      std::cout << "candidate = " << candidate << std::endl;
 
+      // Use soft-thresholding to perform coordinate descent.
       float new_alpha = SoftThreshold(candidate, 
         options.regularizations.symmetric_l1()/ai_squared);
-      std::cout << "compute new alpha" << new_alpha << std::endl;
 
+      // Update delta dense.
       model_weights.UpdateDenseDeltaWeights(
           context->eigen_cpu_device(), new_alpha - alpha, id);
 
@@ -372,13 +376,12 @@ void DoComputeDual(const ComputeOptions& options, OpKernelContext* const context
       //    \Delta W = A_k \Delta\alpha_k
       // We use V = W - b, so that use example_state_data to store v, initially 
       //    \alpha = 0, V = 0
-      v += examples.DeanseFeatureAsMatrix(id) * v.constant(new_alpha - alpha);
+      v += examples.DenseFeatureAsMatrix(id) * v.constant(new_alpha - alpha);
     }
   };
 
   // TODO(sibyl-Aix6ihai): Tune this properly based on sparsity of the data,
   // number of cpus, and cost per example.
-
   const int64 kCostPerUnit = examples.num_examples();
   const DeviceBase::CpuWorkerThreads& worker_threads =
       *context->device()->tensorflow_cpu_worker_threads();
@@ -387,88 +390,85 @@ void DoComputeDual(const ComputeOptions& options, OpKernelContext* const context
   Shard(worker_threads.num_threads, worker_threads.workers,
         options.num_dense_features, kCostPerUnit, train_step_dense);
 
+  // Apply changes to `example_state_data`
   example_state_data.slice(
     Eigen::array<int, 2>({0,0}), Eigen::array<int, 2>({num_examples, 1})) = v;
 
-
-  auto sparse_feature_dot_residual = [&](int sf_indices, int indices){
-    float sum = 0;
-    for (int example_id = 0; example_id < num_examples; ++example_id){
-      // Find the feature in the sparse feature group 
-      const Example& example = examples.example(example_id);
-      float sv = example.sparse_value(sf_indices, indices);
-      // TODO: make `example_state_data` and `v` more consistent.
-      sum += (examples.labels()(example_id, 0) - example_state_data(example_id, 0)) * sv ;
-    }
-    return sum;
-  };
-
-  // Update sparse features
+  // Apply LASSO solver to sparse features. 
   auto train_step_sparse = [&](const int64 begin, const int64 end) {
     // The static_cast here is safe since begin and end can be at most
     // num_examples which is an int.
-    // TODO: change `sf_indices` to a better name
-    for (int sf_indices = static_cast<int>(begin); sf_indices < end; ++sf_indices) {
-      // TODO: Don't use FeatureWeightsSparseStorage directly here.
+    for (int sfw_idx = static_cast<int>(begin); sfw_idx < end; ++sfw_idx) {
       const sdca::FeatureWeightsSparseStorage& sparse_weights =
-          model_weights.sparse_weights()[sf_indices];
-      std::cout << "\033[1;31m" << "train_step_sparse = " << sf_indices  << "\033[0m" << std::endl;
+          model_weights.sparse_weights()[sfw_idx];
 
-      // For each feature in this sparse feature column, train one step.
-      for (int64 id = 0; id < sparse_weights.num_ids(); ++id){
-        int64 indices = sparse_weights.id_to_indices(id);
-        float ai_squared = examples.SparseFeatureSquaredNorm(sf_indices, indices);
-        // std::cout << "indices = " << indices << std::endl;
-        std::cout << "ai_squared = " << ai_squared << std::endl;
-        
-        float ai_dot_residual = sparse_feature_dot_residual(sf_indices, indices);
-        std::cout << "ai_dot_residual = " << ai_dot_residual << std::endl;
+      int num_features = sparse_weights.num_weights();
 
-        if (std::abs(ai_squared) < 10e-10){
-          // If this featuer is almost 0, then we don't do the proximal step.
+      // This 2D object is used to store (example_index, feature_value) pair.
+      // The first dimension is the index of the feature in this feature group.
+      std::vector<std::vector<std::pair<int, float> > > feature_values(num_features);
+
+      std::vector<float> ai_squared(num_features);
+      std::vector<float> ai_dot_residual(num_features);
+
+      // Compute squared norm of a column and construct `feature_values` at the 
+      // same time.
+      for (int example_id = 0; example_id < num_examples; ++example_id){
+        const Example& example = examples.example(example_id);
+        const Example::SparseFeatures& sf = example.sparse_feature(sfw_idx);
+        for (int i = 0; i < sf.indices->size(); ++i){
+          int id = sparse_weights.indices_to_id((*sf.indices)(i));
+          float feature_value = sf.values == nullptr ? 1.0 : (*sf.values)(i);
+          ai_squared[id] += feature_value * feature_value;
+          feature_values[id].push_back(std::make_pair(example_id, feature_value));
+        }
+      } 
+
+      for (int id = 0; id < num_features; ++id){
+        // If this feature is almost 0, then we don't do the proximal step.
+        if (std::abs(ai_squared[id]) < 10e-10) {
           continue;
         }
 
-        // TODO: use alpha implicitly as alpha can be dense and sparse. While the 
-        // primal in this case can be float.
-        // TODO: Add support for num_loss_
+        int64 indices = sparse_weights.id_to_indices(id);
+
         float alpha = sparse_weights.nominals_by_id(0, id) 
-                   + sparse_weights.deltas_by_id(0, id);
+                    + sparse_weights.deltas_by_id(0, id);
 
-        // std::cout << "alpha = " << alpha << std::endl;
-        
-        float candidate = ai_dot_residual/ai_squared + alpha;
-        // std::cout << "candidate = " << candidate << std::endl;
-
-        float new_alpha = SoftThreshold(candidate, 
-          options.regularizations.symmetric_l1()/ai_squared);
-        // std::cout << "new alpha = " << new_alpha << std::endl;
-        
-        model_weights.UpdateSparseDeltaWeights(
-            context->eigen_cpu_device(), new_alpha - alpha, sf_indices, indices);
-
-        // Update v by 
-        //        \Delta v = A_i * \Delta\alpha
-        for (int example_id = 0; example_id < num_examples; ++example_id){
-          // Find the feature in the sparse feature group 
-          const Example& example = examples.example(example_id);
-          // TODO: (Prefixed) define `indices` in a suitable way.
-          float sv = example.sparse_value(sf_indices, indices);
-
-          example_state_data(example_id, 0) += sv * (new_alpha - alpha);
+        // compute inner production of a sparse feature with feature value
+        float ai_dot_residual = 0;
+        for (int i = 0; i < feature_values[id].size(); ++i){
+          int example_id = feature_values[id][i].first;
+          ai_dot_residual += feature_values[id][i].second * 
+          (examples.labels()(example_id, 0) - example_state_data(example_id, 0));
         }
-        // std::cout << "v has been updated" << std::endl;
-      } // Loop of indices in a column.s
 
+        float candidate = ai_dot_residual/ai_squared[id] + alpha;
+
+        // Apply softthresholding in this coordinate
+        float new_alpha = SoftThreshold(candidate, 
+          options.regularizations.symmetric_l1()/ai_squared[id]);
+
+        float delta_alpha = new_alpha - alpha;
+
+        // Update sparse delta weights
+        model_weights.UpdateSparseDeltaWeights(context->eigen_cpu_device(), 
+          delta_alpha, sfw_idx, indices);
+
+        // Update `v`
+        for (int i = 0; i < feature_values[id].size(); ++i){
+          int example_id = feature_values[id][i].first;
+          example_state_data(example_id, 0) += feature_values[id][i].second * delta_alpha;
+        }
+      }
     }
   };
 
-
+  //  Number of features in each group cane be unbalanced. Tune this parameter 
+  //  for better performance.
   Shard(worker_threads.num_threads, worker_threads.workers,
         options.num_sparse_features, kCostPerUnit, train_step_sparse);
 
-  // std::cout << "Duality Gap = " << ComputeL1DualityGap(model_weights, examples, options)
-  //           << std::endl;
   OP_REQUIRES_OK(context, train_step_status);
 }
 
