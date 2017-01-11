@@ -56,12 +56,6 @@ void FeatureWeightsDenseStorage::UpdateDenseDeltaWeights(
   }
 }
 
-void FeatureWeightsDenseStorage::UpdateDenseDeltaWeights(
-    const Eigen::ThreadPoolDevice& device, double delta_alpha){
-  deltas_.device(device) =
-        deltas_ + deltas_.constant(delta_alpha);
-}
-
 void FeatureWeightsSparseStorage::UpdateSparseDeltaWeights(
     const Eigen::ThreadPoolDevice& device,
     const Example::SparseFeatures& sparse_features,
@@ -94,19 +88,6 @@ void ModelWeights::UpdateDeltaWeights(
   }
 }
 
-void ModelWeights::UpdateDeltaWeights(const Eigen::ThreadPoolDevice& device, 
-    const float delta_alpha, int i){
-  dense_weights_[i].UpdateDenseDeltaWeights(device, delta_alpha);
-}
-
-float ModelWeights::l1_norm() const {
-  float sum = 0;
-  for (size_t i = 0; i < dense_weights_.size(); ++i){
-    sum += std::abs(dense_weights_[i].weight());
-  }
-  return sum;
-}
-
 Status ModelWeights::Initialize(OpKernelContext* const context) {
   OpInputList sparse_indices_inputs;
   TF_RETURN_IF_ERROR(
@@ -134,9 +115,13 @@ Status ModelWeights::Initialize(OpKernelContext* const context) {
     auto deltas = delta_t->shaped<float, 2>({1, delta_t->NumElements()});
     deltas.setZero();
     sparse_weights_.emplace_back(FeatureWeightsSparseStorage{
+        // Sparse weight indices
         sparse_indices_inputs[i].flat<int64>(),
+        // Nominal value of weight : either initial value or the weight before
+        // this training step
         sparse_weights_inputs[i].shaped<float, 2>(
             {1, sparse_weights_inputs[i].NumElements()}),
+        // Initialize deltas as 0 before this training step
         deltas});
   }
 
@@ -208,7 +193,6 @@ const ExampleStatistics Example::ComputeWxAndWeightedExampleNorm(
         dense_weights.nominals() +
         dense_weights.deltas() *
             dense_weights.deltas().constant(num_loss_partitions);
-
     if (num_weight_vectors == 1) {
       const Eigen::Tensor<float, 0, Eigen::RowMajor> prev_prediction =
           (dense_vector.Row() *
@@ -219,9 +203,9 @@ const ExampleStatistics Example::ComputeWxAndWeightedExampleNorm(
               .sum();
       const Eigen::Tensor<float, 0, Eigen::RowMajor> prediction =
           (dense_vector.Row() *
-           // regularization.EigenShrinkVector(
+           regularization.EigenShrinkVector(
                Eigen::TensorMap<Eigen::Tensor<const float, 1, Eigen::RowMajor>>(
-                   feature_weights.data(), feature_weights.dimension(1)))
+                   feature_weights.data(), feature_weights.dimension(1))))
               .sum();
       result.prev_wx[0] += prev_prediction();
       result.wx[0] += prediction();
@@ -337,6 +321,7 @@ Status Examples::Initialize(OpKernelContext* const context,
   OpInputList sparse_feature_indices_inputs;
   TF_RETURN_IF_ERROR(context->input_list("sparse_feature_indices",
                                          &sparse_feature_indices_inputs));
+
   OpInputList sparse_feature_values_inputs;
   if (num_sparse_features_with_values > 0) {
     TF_RETURN_IF_ERROR(context->input_list("sparse_feature_values",
@@ -375,6 +360,12 @@ Status Examples::Initialize(OpKernelContext* const context,
     example->example_weight_ = example_weights(example_id);
     example->example_label_ = example_labels(example_id);
   }
+
+  // Convert the label 0/1 to -1/+1 for dual optimizer.
+  TTypes<float>::ConstMatrix m(example_labels.data(), num_examples, 1);
+  labels_.reset(new Eigen::Tensor<float, 2, Eigen::RowMajor>(m));
+  (*labels_) = (*labels_) * (*labels_).constant(2) - (*labels_).constant(1);
+
   const DeviceBase::CpuWorkerThreads& worker_threads =
       *context->device()->tensorflow_cpu_worker_threads();
   TF_RETURN_IF_ERROR(CreateSparseFeatureRepresentation(
@@ -424,6 +415,9 @@ Status Examples::CreateSparseFeatureRepresentation(
             example_indices(start_id) == example_id) {
           sparse_features->indices.reset(new UnalignedInt64Vector(
               &(feature_indices(start_id)), end_id - start_id));
+
+          // The first (sparse_feature_values_inputs.size()) features groups
+          // have values according to the implementation of `SDCAOptimizer`
           if (sparse_feature_values_inputs.size() > i) {
             auto feature_weights =
                 sparse_feature_values_inputs[i].flat<float>();
@@ -539,43 +533,37 @@ void Examples::ComputeSquaredNormPerExample(
         kCostPerUnit, compute_example_norm);
 }
 
-void Examples::InitializeW(const int num_loss_partitions, 
-  const Regularizations& regularization, const ModelWeights& model_weights){
-    // Allocate memory for primal weight w.
-    w.reset(new Eigen::Tensor<float, 2, Eigen::RowMajor>(num_examples(), 1));
-
-    // Initialize weight with $w = A\alpha - b$
-    for (unsigned int i = 0; i < num_examples(); ++i){
-      const ExampleStatistics example_statistics =
-      examples_[i].ComputeWxAndWeightedExampleNorm(
-          num_loss_partitions, model_weights,
-          regularization, 1 /* num_weight_vectors */);
-
-      float example_label = examples_[i].example_label();
-      (*w)(i, 0) = example_statistics.wx[0] - example_label;
-    }
-}
-
-// Compute inner product of Ai and residual
-float Examples::ComputeAiDotR(int i) const {
-  auto Ai = examples_[0].dense_vectors()[i]->Col();
-  const Eigen::Tensor<float, 0, Eigen::RowMajor> sn = (Ai * WAsCol()).sum();
-  return -sn();
-}
-
-float Examples::ComputeAiSquared(int i) const{
+float Examples::DenseFeatureSquaredNorm(int i) const{
   auto Ai = examples_[0].dense_vectors()[i]->Col();
   const Eigen::Tensor<float, 0, Eigen::RowMajor> sn = Ai.square().sum();
   return sn();
 }
 
-void Examples::UpdateW(int i, float delta_alpha){
-  auto Ai = examples_[0].dense_vectors()[i]->Col();
-  (*w) += Ai * Ai.constant(delta_alpha);
+void ModelWeights::UpdateDenseDeltaWeights(
+    const Eigen::ThreadPoolDevice& device,
+    const float delta_alpha, int i){
+  dense_weights_[i].UpdateDenseDeltaWeights(device, delta_alpha);
 }
 
-Eigen::TensorMap<Eigen::Tensor<float, 1, Eigen::RowMajor>> Examples::WAsCol() const {
-  return Eigen::TensorMap<Eigen::Tensor<float, 1, Eigen::RowMajor>>((*w).data(), (*w).dimension(0));
+void ModelWeights::UpdateSparseDeltaWeights(
+    const Eigen::ThreadPoolDevice& device,
+    const float delta_alpha, int sf_id, int sf_indices){
+  sparse_weights_[sf_id].UpdateSparseDeltaWeights(device,
+    sf_indices, delta_alpha);
+}
+
+void FeatureWeightsDenseStorage::UpdateDenseDeltaWeights(
+    const Eigen::ThreadPoolDevice& device, double delta_alpha){
+  deltas_.device(device) =
+        deltas_ + deltas_.constant(delta_alpha);
+}
+
+void FeatureWeightsSparseStorage::UpdateSparseDeltaWeights(
+    const Eigen::ThreadPoolDevice& device,
+    const int64 sf_indices,
+    const double delta_alpha) {
+  auto it = indices_to_id_.find(sf_indices);
+  deltas_(0, it->second) += delta_alpha;
 }
 
 }  // namespace sdca

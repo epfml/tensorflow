@@ -105,7 +105,8 @@ class SVM(trainable.Trainable, evaluable.Evaluable):
                num_loss_partitions=1,
                kernels=None,
                config=None,
-               feature_engineering_fn=None):
+               feature_engineering_fn=None,
+               dual_method=False):
     """Constructs a `SVM~ estimator object.
 
     Args:
@@ -133,6 +134,10 @@ class SVM(trainable.Trainable, evaluable.Evaluable):
                         labels which are the output of `input_fn` and
                         returns features and labels which will be fed
                         into the model.
+      dual_method: choose dual method or primal method. If true, use the dual 
+        method to solve LASSO problem (See "L1-Regularized Distributed
+        Optimization: A Communication-Efficient Primal-Dual Framework"). If
+        false, use primal sdca.
 
     Raises:
       ValueError: if kernels passed is not None.
@@ -143,7 +148,8 @@ class SVM(trainable.Trainable, evaluable.Evaluable):
         example_id_column=example_id_column,
         num_loss_partitions=num_loss_partitions,
         symmetric_l1_regularization=l1_regularization,
-        symmetric_l2_regularization=l2_regularization)
+        symmetric_l2_regularization=l2_regularization,
+        dual_method=dual_method)
 
     self._feature_columns = feature_columns
     self._chief_hook = linear._SdcaUpdateWeightsHook()  # pylint: disable=protected-access
@@ -152,9 +158,8 @@ class SVM(trainable.Trainable, evaluable.Evaluable):
         model_dir=model_dir,
         config=config,
         params={
-            "head": head_lib._binary_svm_head(  # pylint: disable=protected-access
-                weight_column_name=weight_column_name,
-                enable_centered_bias=False),
+            "head":  head_lib._binary_svm_head(weight_column_name=weight_column_name,
+                      enable_centered_bias=False),
             "feature_columns": feature_columns,
             "optimizer": self._optimizer,
             "weight_column_name": weight_column_name,

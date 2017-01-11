@@ -73,7 +73,6 @@ struct ExampleStatistics {
       : wx(num_weight_vectors, 0.0), prev_wx(num_weight_vectors, 0.0) {}
 };
 
-// Managing regularization terms.
 class Regularizations {
  public:
   Regularizations(){};
@@ -113,7 +112,6 @@ class Regularizations {
 
   float symmetric_l2() const { return symmetric_l2_; }
   float symmetric_l1() const { return symmetric_l1_; }
-
  private:
   float symmetric_l1_ = 0;
   float symmetric_l2_ = 0;
@@ -125,7 +123,6 @@ class Regularizations {
 };
 
 class ModelWeights;
-class Examples;
 
 // Struct describing a single example.
 class Example {
@@ -153,6 +150,15 @@ class Example {
   struct SparseFeatures {
     std::unique_ptr<TTypes<const int64>::UnalignedConstVec> indices;
     std::unique_ptr<TTypes<const float>::UnalignedConstVec> values;  // nullptr encodes optional.
+
+    // float query_value(const int64 index) const{
+    //   for (int i = 0; i < indices->size(); i++){
+    //     if (index == (*indices)(i)){
+    //       return values == nullptr ? 1.0 : (*values)(i);
+    //     }
+    //   }
+    //   return 0.0;
+    // }
   };
 
   // A dense vector which is a row-slice of the underlying matrix.
@@ -174,12 +180,22 @@ class Example {
 
     // Returns a row slice as a 1 * F matrix, where F is the number of features.
     Eigen::TensorMap<Eigen::Tensor<const float, 2, Eigen::RowMajor>>
+    ColAsMatrix() const {
+      return Eigen::TensorMap<Eigen::Tensor<const float, 2, Eigen::RowMajor>>(
+          data_matrix.data(), data_matrix.dimension(0), 1);
+    }
+
+    // Returns a row slice as a 1 * F matrix, where F is the number of features.
+    Eigen::TensorMap<Eigen::Tensor<const float, 2, Eigen::RowMajor>>
     RowAsMatrix() const {
       return Eigen::TensorMap<Eigen::Tensor<const float, 2, Eigen::RowMajor>>(
           data_matrix.data() + row_index * data_matrix.dimension(1), 1,
           data_matrix.dimension(1));
     }
 
+    // data_matrix contains all of the information of dense features.
+    // shape: num_examples * num_dense_features
+    // For each DenseVector instance, the data_matrix points to same matrix.
     const TTypes<float>::ConstMatrix data_matrix;
     const int64 row_index;
   };
@@ -187,6 +203,27 @@ class Example {
   const std::vector<std::unique_ptr<DenseVector> >& dense_vectors() const{
     return dense_vectors_;
   }
+
+  const Example::SparseFeatures& sparse_feature(const int sf_idx) const {
+    return sparse_features_[sf_idx];
+  }
+
+  // Return the sprase value of `sparse_feature_index`-th feature with `indices`
+  // float sparse_value(int sparse_feature_index, int64 indices) const{
+  //   // TODO: It seems better to compute the information of the indices at the 
+  //   // beginning of initialization.
+  //   const SparseFeatures& sparse_feature = 
+  //           sparse_features_[sparse_feature_index];
+
+  //   return sparse_feature.query_value(indices);
+  // }
+  ////////////////////////////////////////////////////////////////////////////
+
+  // float feature(int i) const {
+  //   float tmp = dense_vectors_[i]->RowAsMatrix()(0, 0);
+  //   return tmp;
+  // }
+  ////////////////////////////////////////////////////////////////////////////
 
  private:
   std::vector<SparseFeatures> sparse_features_;
@@ -226,9 +263,6 @@ class FeatureWeightsDenseStorage {
   // Delta weights durining mini-batch updates.
   TTypes<float>::Matrix deltas() const { return deltas_; }
 
-  // Get weight
-  float weight() const { return nominals_(0,0) + deltas_(0,0);}
-
   // Updates delta weights based on active dense features in the example and
   // the corresponding dual residual.
   void UpdateDenseDeltaWeights(
@@ -236,9 +270,9 @@ class FeatureWeightsDenseStorage {
       const Example::DenseVector& dense_vector,
       const std::vector<double>& normalized_bounded_dual_delta);
 
+  float weight() const { return nominals_(0,0) + deltas_(0,0);}
   // Update delta weights using dual alpha
-  void UpdateDenseDeltaWeights(
-    const Eigen::ThreadPoolDevice& device,
+  void UpdateDenseDeltaWeights(const Eigen::ThreadPoolDevice& device,
     double delta_alpha);
 
  private:
@@ -251,6 +285,15 @@ class FeatureWeightsDenseStorage {
 // Similar to FeatureWeightsDenseStorage, but the underlying weights are stored
 // in an unordered map.
 class FeatureWeightsSparseStorage {
+  // `FeatureWeightsSparseStorage` stores weights to a sparse feature group.
+  // Suppose a sparse feature has N categories, then there are N weight in this
+  // storage instance. The length of `indices` equals the columns of nominals 
+  // equals N.
+
+  // The `indices` are the index of weight within the feature group. For 
+  // FeatureColumns like `sparse_column_with_keys`, the `index` equals to `id`.
+  // For `hash_bucket`, the `indices` can be very large while `id` is the
+  // actual index within the storage.
  public:
   FeatureWeightsSparseStorage(const TTypes<const int64>::Vec indices,
                               const TTypes<const float>::Matrix nominals,
@@ -260,6 +303,7 @@ class FeatureWeightsSparseStorage {
     // storage.
     for (int64 j = 0; j < indices.size(); ++j) {
       indices_to_id_[indices(j)] = j;
+      id_to_indices_[j] = indices(j);
     }
   }
 
@@ -287,6 +331,34 @@ class FeatureWeightsSparseStorage {
       const Example::SparseFeatures& sparse_features,
       const std::vector<double>& normalized_bounded_dual_delta);
 
+  void UpdateSparseDeltaWeights(
+    const Eigen::ThreadPoolDevice& device,
+    const int64 sf_indices,
+    const double delta_alpha);
+
+  // The difference of the following tow class with the above two is that 
+  float nominals_by_id(const int class_id, const int64 id) const {
+    return nominals_(class_id, id);
+  }
+
+  float deltas_by_id(const int class_id, const int64 id) const {
+    return deltas_(class_id, id);
+  }
+
+  int64 id_to_indices(int64 id) const {
+    return id_to_indices_.at(id);
+  }
+
+  int64 indices_to_id(int64 indices) const {
+    return indices_to_id_.at(indices);
+  }
+
+  int num_weights() const{
+    return nominals_.dimension(1);
+  }
+
+ private:
+   std::unordered_map<int64, int64> id_to_indices_;
  private:
   // The nominal value of the weight for a feature (indexed by its id).
   const TTypes<const float>::Matrix nominals_;
@@ -316,10 +388,6 @@ class ModelWeights {
       const Eigen::ThreadPoolDevice& device, const Example& example,
       const std::vector<double>& normalized_bounded_dual_delta);
 
-  // Update i-th weight with delta dual weight.
-  void UpdateDeltaWeights(const Eigen::ThreadPoolDevice& device, 
-    const float delta_alpha, int i);
-
   Status Initialize(OpKernelContext* const context);
 
   const std::vector<FeatureWeightsSparseStorage>& sparse_weights() const {
@@ -330,8 +398,14 @@ class ModelWeights {
     return dense_weights_;
   }
 
-  float l1_norm() const;
+  // Update i-th weight with delta dual weight.
+  void UpdateDenseDeltaWeights(const Eigen::ThreadPoolDevice& device, 
+    const float delta_alpha, int i);
 
+  void UpdateSparseDeltaWeights(
+    const Eigen::ThreadPoolDevice& device,
+    const float delta_alpha, int sf_id, int sf_indices);
+  ////////////////////////////////////////////////
  private:
   std::vector<FeatureWeightsSparseStorage> sparse_weights_;
   std::vector<FeatureWeightsDenseStorage> dense_weights_;
@@ -374,31 +448,27 @@ class Examples {
                     int num_sparse_features_with_values,
                     int num_dense_features);
 
-
-  // Initialize primal weight using formula 
-  //            w = \grad f(A\alpha) = A\alpha - b
-  void InitializeW(const int num_loss_partitions, 
-  const Regularizations& regularization, const ModelWeights& model_weights);
-
-  // Compute the inner product between a column of A and residual R
-  float ComputeAiDotR(int i) const;
-
-  // Compute squared norm of i-th column of A
-  float ComputeAiSquared(int i) const;
-
-  // Update primal weight when dual weight alpha update in i-th direction.
-  void UpdateW(int i, float delta_alpha);
-
-  // Get i-th element of primal weight 
-  float weight(int i) const { return (*w)(i, 0);}
-
-  // Return column representation of primal weight
-  Eigen::TensorMap<Eigen::Tensor<float, 1, Eigen::RowMajor>> WAsCol() const ;
+  //////////////////////////////////////////////////////////////////////////////
+  // Compute squared norm of i-th dense column of A
+  float DenseFeatureSquaredNorm (int i) const;
 
   // Return i-th column of Matrix A
-  Eigen::TensorMap<Eigen::Tensor<const float, 1, Eigen::RowMajor>> Ai(int i) const{
-    return example(0).dense_vectors_[i]->Col();
+  // Eigen::TensorMap<Eigen::Tensor<const float, 1, Eigen::RowMajor>> Ai(int i) const{
+  //   return example(0).dense_vectors_[i]->Col();
+  // }
+
+  Eigen::TensorMap<Eigen::Tensor<const float, 2, Eigen::RowMajor>>
+    DenseFeatureAsMatrix(int i) const{
+    return example(0).dense_vectors_[i]->ColAsMatrix();
   }
+
+  TTypes<float>::ConstMatrix labels()const{
+    return TTypes<float>::ConstMatrix(labels_->data(), labels_->dimension(0),
+     labels_->dimension(1));
+  }
+
+ private:
+  std::unique_ptr<Eigen::Tensor<float, 2, Eigen::RowMajor> > labels_;
 
  private:
   // Reads the input tensors, and builds the internal representation for sparse
@@ -430,12 +500,6 @@ class Examples {
 
   // All examples in the batch.
   std::vector<Example> examples_;
-
-  // store primal weight w
-  std::unique_ptr<Eigen::Tensor<float, 2, Eigen::RowMajor> > w;
-
-  // vector of gradient
-  std::unique_ptr<Eigen::Tensor<float, 2, Eigen::RowMajor> > grad;
 
   // Adaptative sampling variables
   std::vector<float> probabilities_;

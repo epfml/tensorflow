@@ -42,6 +42,7 @@ REGISTER_OP("SdcaOptimizer")
         "loss_type: {'logistic_loss', 'squared_loss', 'hinge_loss',"
         "'smooth_hinge_loss'}")
     .Attr("adaptative : bool=false")
+    .Attr("dual_method: bool=false")
     .Attr("num_sparse_features: int >= 0")
     .Attr("num_sparse_features_with_values: int >= 0")
     .Attr("num_dense_features: int >= 0")

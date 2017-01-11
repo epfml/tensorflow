@@ -24,6 +24,7 @@ limitations under the License.
 #include <new>
 #include <string>
 #include <vector>
+#include <chrono>
 
 #include "third_party/eigen3/unsupported/Eigen/CXX11/Tensor"
 #include "tensorflow/core/framework/device_base.h"
@@ -80,6 +81,8 @@ struct ComputeOptions {
                                       "Unsupported loss type: ", loss_type));
     }
     OP_REQUIRES_OK(context, context->GetAttr("adaptative", &adaptative));
+    OP_REQUIRES_OK(context, context->GetAttr("dual_method", &dual_method));
+
     OP_REQUIRES_OK(
         context, context->GetAttr("num_sparse_features", &num_sparse_features));
     OP_REQUIRES_OK(context, context->GetAttr("num_sparse_features_with_values",
@@ -112,55 +115,9 @@ struct ComputeOptions {
   int num_inner_iterations = 0;
   int num_loss_partitions = 0;
   bool adaptative = false;
+  bool dual_method  = false;
   Regularizations regularizations;
 };
-
-// Compute the soft threshold for this function
-double SoftThreshold(const double alpha, const double gamma){
-  double shrink = std::max(std::abs(alpha) - gamma, 0.0);
-  return std::copysign(shrink, alpha);
-}
-
-// See Primal-Dual Rates and Certificates (2016) formula (18)
-//    G(\alpha) = <w, A\alpha> + B[||A^Tw||_\infty-\lambda]_+ + \lambda||\alpha||_1
-// Compute the duality gap for L1_regularized Problem.
-float ComputeL1DualityGap(const ModelWeights& model_weights, const Examples& examples,
-  const ComputeOptions& options){
-
-  // Part: \lambda||\alpha||_1
-  float l1 = options.regularizations.symmetric_l1();
-  float l1_regularized = l1 * model_weights.l1_norm();
-
-  // B = 1/\lambda f(0) = 1/(2\lambda) ||b||_2^2
-  float B = 0;
-  for (int i = 0; i < examples.num_examples(); ++i){
-    B += std::pow(examples.example(i).example_label(), 2);
-  }
-  B = B/(2*l1); 
-
-  // <w, A\alpha>
-  float w_A_alpha = 0;
-  for (size_t i = 0; i < examples.num_examples(); ++i){
-    const ExampleStatistics example_statistics =
-    examples.example(i).ComputeWxAndWeightedExampleNorm(
-        options.num_loss_partitions, model_weights,
-        options.regularizations, 1 /* num_weight_vectors */);
-
-    w_A_alpha += example_statistics.wx[0] * examples.weight(i);
-  }
-
-  float max_At_w = std::numeric_limits<float>::min();
-  for (int i = 0; i < examples.num_features(); ++i){
-    auto Ai = examples.Ai(i);
-    auto w  = examples.WAsCol();
-    // float sn =0;
-    // sn() = (Ai * w).sum();
-    Eigen::Tensor<float, 0, Eigen::RowMajor> sn = (Ai * w).sum();
-    max_At_w = std::max(std::abs(sn()), max_At_w);
-  }
-
-  return w_A_alpha + B * std::max(max_At_w - l1, static_cast<float>(0)) + l1_regularized;
-}
 
 // TODO(shengx): The helper classes/methods are changed to support multiclass
 // SDCA, which lead to changes within this function. Need to revisit the
@@ -199,74 +156,318 @@ void DoCompute(const ComputeOptions& options, OpKernelContext* const context) {
                        /*num_weight_vectors =*/1));
   }
 
-  // example_state_data(0, 0) += 1;
-  // std::cout << "Training step (outer loop) = " <<  example_state_data(0, 0) << std::endl;
-
-  examples.InitializeW(options.num_loss_partitions, options.regularizations, 
-                       model_weights);
-
   mutex mu;
   Status train_step_status GUARDED_BY(mu);
   std::atomic<std::int64_t> atomic_index(-1);
-
   auto train_step = [&](const int64 begin, const int64 end) {
     // The static_cast here is safe since begin and end can be at most
     // num_examples which is an int.
     for (int id = static_cast<int>(begin); id < end; ++id) {
-      // const Example& example = examples.example(id);
-      float alpha = model_weights.dense_weights()[id].weight();
+      const int64 example_index =
+          examples.sampled_index(++atomic_index, options.adaptative);
+      const Example& example = examples.example(example_index);
+      const float dual = example_state_data(example_index, 0);
+      const float example_weight = example.example_weight();
+      float example_label = example.example_label();
+      const Status conversion_status =
+          options.loss_updater->ConvertLabel(&example_label);
+      if (!conversion_status.ok()) {
+        mutex_lock l(mu);
+        train_step_status = conversion_status;
+        // Return from this worker thread - the calling thread is
+        // responsible for checking context status and returning on error.
+        return;
+      }
 
-      float air = examples.ComputeAiDotR(id);
+      // Compute wx, example norm weighted by regularization, dual loss,
+      // primal loss.
+      // For binary SDCA, num_weight_vectors should be one.
+      const ExampleStatistics example_statistics =
+          example.ComputeWxAndWeightedExampleNorm(
+              options.num_loss_partitions, model_weights,
+              options.regularizations, 1 /* num_weight_vectors */);
 
-      float ai_squared = examples.ComputeAiSquared(id);
+      const double new_dual = options.loss_updater->ComputeUpdatedDual(
+          options.num_loss_partitions, example_label, example_weight, dual,
+          example_statistics.wx[0], example_statistics.normalized_squared_norm);
 
+      // Compute new weights.
+      const double normalized_bounded_dual_delta =
+          (new_dual - dual) * example_weight /
+          options.regularizations.symmetric_l2();
+      model_weights.UpdateDeltaWeights(
+          context->eigen_cpu_device(), example,
+          std::vector<double>{normalized_bounded_dual_delta});
+
+      // Update example data.
+      example_state_data(example_index, 0) = new_dual;
+      example_state_data(example_index, 1) =
+          options.loss_updater->ComputePrimalLoss(
+              example_statistics.prev_wx[0], example_label, example_weight);
+      example_state_data(example_index, 2) =
+          options.loss_updater->ComputeDualLoss(dual, example_label,
+                                                example_weight);
+      example_state_data(example_index, 3) = example_weight;
+    }
+  };
+  // TODO(sibyl-Aix6ihai): Tune this properly based on sparsity of the data,
+  // number of cpus, and cost per example.
+  const int64 kCostPerUnit = examples.num_features();
+  const DeviceBase::CpuWorkerThreads& worker_threads =
+      *context->device()->tensorflow_cpu_worker_threads();
+
+  Shard(worker_threads.num_threads, worker_threads.workers,
+        examples.num_examples(), kCostPerUnit, train_step);
+  OP_REQUIRES_OK(context, train_step_status);
+}
+
+//////////////////////////////////////////////////////////////////////////////
+// Compute the soft threshold for this function
+double SoftThreshold(const double alpha, const double gamma){
+  double shrink = std::max(std::abs(alpha) - gamma, 0.0);
+  return std::copysign(shrink, alpha);
+}
+
+// TODO: Add Primal-Dual Certificates.
+// See Primal-Dual Rates and Certificates (2016) formula (18)
+//    G(\alpha) = <w, A\alpha> + B[||A^Tw||_\infty-\lambda]_+ + \lambda||\alpha||_1
+// Compute the duality gap for L1_regularized Problem.
+// float ComputeL1DualityGap(const ModelWeights& model_weights, const Examples& examples,
+//   const ComputeOptions& options){
+
+//   // Part: \lambda||\alpha||_1
+//   float l1 = options.regularizations.symmetric_l1();
+//   float l1_regularized = l1 * model_weights.l1_norm();
+
+//   // B = 1/\lambda f(0) = 1/(2\lambda) ||b||_2^2
+//   float B = 0;
+//   for (int i = 0; i < examples.num_examples(); ++i){
+//     B += std::pow(examples.example(i).example_label(), 2);
+//   }
+//   B = B/(2*l1); 
+
+//   // <w, A\alpha>
+//   float w_A_alpha = 0;
+//   for (size_t i = 0; i < examples.num_examples(); ++i){
+//     const ExampleStatistics example_statistics =
+//     examples.example(i).ComputeWxAndWeightedExampleNorm(
+//         options.num_loss_partitions, model_weights,
+//         options.regularizations, 1 /* num_weight_vectors */);
+
+//     w_A_alpha += example_statistics.wx[0] * examples.weight(i);
+//   }
+
+//   float max_At_w = std::numeric_limits<float>::min();
+//   for (int i = 0; i < examples.num_features(); ++i){
+//     auto Ai = examples.Ai(i);
+//     auto w  = examples.WAsCol();
+//     // float sn =0;
+//     // sn() = (Ai * w).sum();
+//     Eigen::Tensor<float, 0, Eigen::RowMajor> sn = (Ai * w).sum();
+//     max_At_w = std::max(std::abs(sn()), max_At_w);
+//   }
+
+//   return w_A_alpha + B * std::max(max_At_w - l1, static_cast<float>(0)) + l1_regularized;
+// }
+
+// TODO(shengx): The helper classes/methods are changed to support multiclass
+// SDCA, which lead to changes within this function. Need to revisit the
+// convergence once the multiclass SDCA is in.
+// TODO: Add `example_weight` back.
+// TODO: For the moment, the loss function is fixed to be squared norm.
+void DoComputeDual(const ComputeOptions& options, OpKernelContext* const context){
+  // Implement lasso solver: 
+  //  1. dual variable `\alpha` is stored in ModelWeights
+  //  2. primal weight `w = A\alpha - b` is not explictly stored. We store
+  //      `v = A\alpha`. In distributed computing, we will push local `v` and 
+  //      aggregate it in parameter server. When they are accumulated, we fetch
+  //      updates from `v` and continue to the next step.
+  //  3. Note that our code is based on the framework proxSDCA. The `features`
+  //     below actually means the columns of `A` which in fact is the example 
+  //     associated with `\alpha`.
+  ModelWeights model_weights;
+  OP_REQUIRES_OK(context, model_weights.Initialize(context));
+
+  Examples examples;
+  OP_REQUIRES_OK(
+      context,
+      examples.Initialize(context, model_weights, options.num_sparse_features,
+                          options.num_sparse_features_with_values,
+                          options.num_dense_features));
+
+  const Tensor* example_state_data_t;
+  OP_REQUIRES_OK(context,
+                 context->input("example_state_data", &example_state_data_t));
+  TensorShape expected_example_state_shape({examples.num_examples(), 4});
+  OP_REQUIRES(context,
+              example_state_data_t->shape() == expected_example_state_shape,
+              errors::InvalidArgument(
+                  "Expected shape ", expected_example_state_shape.DebugString(),
+                  " for example_state_data, got ",
+                  example_state_data_t->shape().DebugString()));
+
+  Tensor mutable_example_state_data_t(*example_state_data_t);
+  // In this function only the first column of `example_state_data` will be 
+  // used. It is used for storing the intermediate variable `v =  A\alpha`.
+  auto example_state_data = mutable_example_state_data_t.matrix<float>();
+  context->set_output("out_example_state_data", mutable_example_state_data_t);
+
+  if (options.adaptative) {
+    OP_REQUIRES_OK(context,
+                   examples.SampleAdaptativeProbabilities(
+                       options.num_loss_partitions, options.regularizations,
+                       model_weights, example_state_data, options.loss_updater,
+                       /*num_weight_vectors =*/1));
+  }
+
+  int num_examples = examples.num_examples();
+
+  // The slice `v` is used for dense features operation.
+  auto v = example_state_data.slice(
+    Eigen::array<int, 2>({0,0}), Eigen::array<int, 2>({num_examples, 1}));
+
+  // Compute dot production of a dense feature and a residual.
+  //              <A_k, r>
+  // where r = b - A\alpha = b - v is the residual.
+  auto dense_feature_dot_residual = [&](int k){
+    const Eigen::Tensor<float, 0, Eigen::RowMajor> sn = 
+        (examples.DenseFeatureAsMatrix(k) * (examples.labels() - v)).sum();
+    return sn();
+  };
+
+  mutex mu;
+  Status train_step_status GUARDED_BY(mu);
+  std::atomic<std::int64_t> atomic_index(-1);
+  // The minimization objective is:
+  //    min D(\alpha) = 1/2 || b - A\alpha||_2^2 + \lambda_1 ||\alpha||_1
+  // Apply coordinate descent to \alpha_i, the updated \alpha_i is given by 
+  // proximal operator (soft-thresholding for squared norm):
+  //    \alpha_i = S_{\lambda/||A_i||^2}(\frac{A_i^Tr}{||A_i||^2}+\alpha_i^{\text{old}})
+  // where soft-thresholding is defined as 
+  //    S_{\gamma}(g)=\text{sgn}(g) (|g|-\gamma)_+
+  auto train_step_dense = [&](const int64 begin, const int64 end) {
+    // The static_cast here is safe since begin and end can be at most
+    // num_examples which is an int.
+    for (int id = static_cast<int>(begin); id < end; ++id) {
+      float ai_squared = examples.DenseFeatureSquaredNorm(id);
+
+      // In case A_i is a vector of 0s, then the corresponding \alpha_i is 0 and 
+      // don't update.
       if (std::abs(ai_squared) < 10e-10){
         continue;
       }
 
-      float candidate = air/ai_squared + alpha;
+      // Compute: A_i^T*r/||A_i||^2+\alpha_i^{old}
+      float ai_dot_residual = dense_feature_dot_residual(id);
+      float alpha = model_weights.dense_weights()[id].weight();
+      float candidate = ai_dot_residual/ai_squared + alpha;
+
+      // Use soft-thresholding to perform coordinate descent.
       float new_alpha = SoftThreshold(candidate, 
         options.regularizations.symmetric_l1()/ai_squared);
 
-      model_weights.UpdateDeltaWeights(
+      // Update delta dense.
+      model_weights.UpdateDenseDeltaWeights(
           context->eigen_cpu_device(), new_alpha - alpha, id);
 
-      examples.UpdateW(id, new_alpha - alpha);
-
-      // std::cout << "\033[1;31mId = " << id
-      //     << ", l1 = " << options.regularizations.symmetric_l1()
-      //     << ", new alpha  = " << model_weights.dense_weights()[id].weight()
-      //     << ", alpha      = " << alpha 
-      //     << ", squared_ai = " << ai_squared
-      //     << ", air        = " << air
-      //     << "\033[0m" << std::endl;
-      // std :: cout << options.regularizations.symmetric_l1() << std :: endl;
-
+      // Primal weight is 
+      //    W = \nabla f(A\alpha) = A\alpha - b
+      // Thus we update it with
+      //    \Delta W = A_k \Delta\alpha_k
+      // We use V = W - b, so that use example_state_data to store v, initially 
+      //    \alpha = 0, V = 0
+      v += examples.DenseFeatureAsMatrix(id) * v.constant(new_alpha - alpha);
     }
   };
 
   // TODO(sibyl-Aix6ihai): Tune this properly based on sparsity of the data,
   // number of cpus, and cost per example.
-  std::cout<< "number of features = " << examples.num_features()<< std::endl;
   const int64 kCostPerUnit = examples.num_examples();
   const DeviceBase::CpuWorkerThreads& worker_threads =
       *context->device()->tensorflow_cpu_worker_threads();
 
+  // Updating dense features
   Shard(worker_threads.num_threads, worker_threads.workers,
-        examples.num_features(), kCostPerUnit, train_step);
+        options.num_dense_features, kCostPerUnit, train_step_dense);
 
-  // for (int i = 0 ; i < examples.num_features(); ++i){
-  //   std::cout << model_weights.dense_weights()[i].deltas() << std::endl;
-  // }
-  // 
- //  std:: cout << "\033[1;31m Labels \033[0m"<< std::endl;
- // for (int i = 0 ; i < examples.num_examples() ; ++i){
- //  std :: cout << examples.example(i).example_label()<< std :: endl;
- // }
+  // Apply changes to `example_state_data`
+  example_state_data.slice(
+    Eigen::array<int, 2>({0,0}), Eigen::array<int, 2>({num_examples, 1})) = v;
 
+  // Apply LASSO solver to sparse features. 
+  auto train_step_sparse = [&](const int64 begin, const int64 end) {
+    // The static_cast here is safe since begin and end can be at most
+    // num_examples which is an int.
+    for (int sfw_idx = static_cast<int>(begin); sfw_idx < end; ++sfw_idx) {
+      const sdca::FeatureWeightsSparseStorage& sparse_weights =
+          model_weights.sparse_weights()[sfw_idx];
 
-  std::cout << "Duality Gap = " << ComputeL1DualityGap(model_weights, examples, options)
-            << std::endl;
+      int num_features = sparse_weights.num_weights();
+
+      // This 2D object is used to store (example_index, feature_value) pair.
+      // The first dimension is the index of the feature in this feature group.
+      std::vector<std::vector<std::pair<int, float> > > feature_values(num_features);
+
+      std::vector<float> ai_squared(num_features);
+      std::vector<float> ai_dot_residual(num_features);
+
+      // Compute squared norm of a column and construct `feature_values` at the 
+      // same time.
+      for (int example_id = 0; example_id < num_examples; ++example_id){
+        const Example& example = examples.example(example_id);
+        const Example::SparseFeatures& sf = example.sparse_feature(sfw_idx);
+        for (int i = 0; i < sf.indices->size(); ++i){
+          int id = sparse_weights.indices_to_id((*sf.indices)(i));
+          float feature_value = sf.values == nullptr ? 1.0 : (*sf.values)(i);
+          ai_squared[id] += feature_value * feature_value;
+          feature_values[id].push_back(std::make_pair(example_id, feature_value));
+        }
+      } 
+
+      for (int id = 0; id < num_features; ++id){
+        // If this feature is almost 0, then we don't do the proximal step.
+        if (std::abs(ai_squared[id]) < 10e-10) {
+          continue;
+        }
+
+        int64 indices = sparse_weights.id_to_indices(id);
+
+        float alpha = sparse_weights.nominals_by_id(0, id) 
+                    + sparse_weights.deltas_by_id(0, id);
+
+        // compute inner production of a sparse feature with feature value
+        float ai_dot_residual = 0;
+        for (int i = 0; i < feature_values[id].size(); ++i){
+          int example_id = feature_values[id][i].first;
+          ai_dot_residual += feature_values[id][i].second * 
+          (examples.labels()(example_id, 0) - example_state_data(example_id, 0));
+        }
+
+        float candidate = ai_dot_residual/ai_squared[id] + alpha;
+
+        // Apply softthresholding in this coordinate
+        float new_alpha = SoftThreshold(candidate, 
+          options.regularizations.symmetric_l1()/ai_squared[id]);
+
+        float delta_alpha = new_alpha - alpha;
+
+        // Update sparse delta weights
+        model_weights.UpdateSparseDeltaWeights(context->eigen_cpu_device(), 
+          delta_alpha, sfw_idx, indices);
+
+        // Update `v`
+        for (int i = 0; i < feature_values[id].size(); ++i){
+          int example_id = feature_values[id][i].first;
+          example_state_data(example_id, 0) += feature_values[id][i].second * delta_alpha;
+        }
+      }
+    }
+  };
+
+  //  Number of features in each group cane be unbalanced. Tune this parameter 
+  //  for better performance.
+  Shard(worker_threads.num_threads, worker_threads.workers,
+        options.num_sparse_features, kCostPerUnit, train_step_sparse);
 
   OP_REQUIRES_OK(context, train_step_status);
 }
@@ -278,8 +479,20 @@ class SdcaOptimizer : public OpKernel {
   explicit SdcaOptimizer(OpKernelConstruction* const context)
       : OpKernel(context), options_(context) {}
 
-  void Compute(OpKernelContext* const context) override {
-    DoCompute(options_, context);
+  void Compute(OpKernelContext* context) override {
+    // The input attribute 'dual_method' specifies the method to be used. 
+    // If it is false, we use primal solver. Otherwise, we use dual method.
+    
+    auto t1 = std::chrono::high_resolution_clock::now();
+    if (!options_.dual_method){
+      DoCompute(options_, context);
+    } else {
+      DoComputeDual(options_, context);
+    }
+    auto t2 = std::chrono::high_resolution_clock::now();
+    std::cout << "One training step took "
+              << std::chrono::duration_cast<std::chrono::milliseconds>(t2-t1).count()
+              << " milliseconds\n";    
   }
 
  private:
@@ -298,33 +511,31 @@ class SdcaShrinkL1 : public OpKernel {
     OP_REQUIRES_OK(context, regularizations_.Initialize(context));
   }
 
-  void Compute(OpKernelContext* const context) override {
-    // OpMutableInputList weights_inputs;
-    // OP_REQUIRES_OK(context,
-    //                context->mutable_input_list("weights", &weights_inputs));
+  void Compute(OpKernelContext* context) override {
+    OpMutableInputList weights_inputs;
+    OP_REQUIRES_OK(context,
+                   context->mutable_input_list("weights", &weights_inputs));
 
-    // auto do_work = [&](const int64 begin, const int64 end) {
-    //   for (int i = begin; i < end; ++i) {
-    //     auto prox_w = weights_inputs.at(i, /*lock_held=*/true).flat<float>();
-    //     std::cout << "i = " << i << ", prox w = " <<  prox_w << std::endl;
-    //     prox_w.device(context->eigen_cpu_device()) =
-    //         regularizations_.EigenShrinkVector(prox_w);
-    //   }
-    // };
+    auto do_work = [&](const int64 begin, const int64 end) {
+      for (int i = begin; i < end; ++i) {
+        auto prox_w = weights_inputs.at(i, /*lock_held=*/true).flat<float>();
+        prox_w.device(context->eigen_cpu_device()) =
+            regularizations_.EigenShrinkVector(prox_w);
+      }
+    };
 
-    // //  This Part of Code will not be used for LASSO as we don't shrink weight.
-    // if (weights_inputs.size() > 0) {
-    //   int64 num_weights = 0;
-    //   for (int i = 0; i < weights_inputs.size(); ++i) {
-    //     num_weights += weights_inputs.at(i, /*lock_held=*/true).NumElements();
-    //   }
-    //   // TODO(sibyl-Aix6ihai): Tune this value.
-    //   const int64 kCostPerUnit = (num_weights * 50) / weights_inputs.size();
-    //   const DeviceBase::CpuWorkerThreads& worker_threads =
-    //       *context->device()->tensorflow_cpu_worker_threads();
-    //   Shard(worker_threads.num_threads, worker_threads.workers,
-    //         weights_inputs.size(), kCostPerUnit, do_work);
-    // }
+    if (weights_inputs.size() > 0) {
+      int64 num_weights = 0;
+      for (int i = 0; i < weights_inputs.size(); ++i) {
+        num_weights += weights_inputs.at(i, /*lock_held=*/true).NumElements();
+      }
+      // TODO(sibyl-Aix6ihai): Tune this value.
+      const int64 kCostPerUnit = (num_weights * 50) / weights_inputs.size();
+      const DeviceBase::CpuWorkerThreads& worker_threads =
+          *context->device()->tensorflow_cpu_worker_threads();
+      Shard(worker_threads.num_threads, worker_threads.workers,
+            weights_inputs.size(), kCostPerUnit, do_work);
+    }
   }
 
  private:
@@ -343,7 +554,7 @@ class SdcaFprint : public OpKernel {
   explicit SdcaFprint(OpKernelConstruction* const context)
       : OpKernel(context) {}
 
-  void Compute(OpKernelContext* const context) override {
+  void Compute(OpKernelContext* context) override {
     const Tensor& input = context->input(0);
     OP_REQUIRES(context, TensorShapeUtils::IsVector(input.shape()),
                 errors::InvalidArgument("Input must be a vector, got shape ",
