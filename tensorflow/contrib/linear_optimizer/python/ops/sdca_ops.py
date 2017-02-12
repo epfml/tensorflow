@@ -36,6 +36,12 @@ from tensorflow.python.ops import variables as var_ops
 from tensorflow.python.ops.nn import sigmoid_cross_entropy_with_logits
 from tensorflow.python.summary import summary
 
+from tensorflow.python.platform import tf_logging as logging
+from tensorflow.python.ops import data_flow_ops
+from tensorflow.core.framework import types_pb2
+from tensorflow.python.training import queue_runner
+
+
 __all__ = ['SdcaModel']
 
 # TODO: example_state_data returned by gen_sdca_ops contains v in its first 
@@ -372,6 +378,16 @@ class SdcaModel(object):
       # pylint: enable=protected-access
 
       # update nominal weights with delta weights obtained from sfw/dfw.
+      # In the original settings, the output of _sdca_optimizer will be stored 
+      # in slots. Then in update_weight(), we will update the weight from slots.
+      # 
+      # For synchronous training, the update slots will be delayed until it is 
+      # allowed to perform next local step.
+      # 
+      # Note that the local weight (self._variables will not be synchronoused)
+      self._example_ids_hashed = example_ids_hashed
+
+     # update nominal weights with delta weights obtained from sfw/dfw.
       with ops.control_dependencies([esu]):
         update_ops = [self._hashtable.insert(example_ids_hashed, esu)]
         # Update the weights before the proximal step.
@@ -538,3 +554,290 @@ class SdcaModel(object):
           self._l2_loss(self._options['symmetric_l2_regularization'])) /
               math_ops.reduce_sum(math_ops.cast(weights, dtypes.float64)) +
               self.unregularized_loss(examples))
+
+# The `SyncSdcaModel` is adapt from `SyncReplicaOptimizer`. The body of 
+# `apply_gradient` is kept but named with `minimize` so that `SDCAOptimizer` can
+# use this class like `SdcaModel`. 
+# 
+# The differences here are, instead of providing variables and associated 
+# gradients, the variable here `global_v` is defined inside the function and the
+# gradient comes from (`example_state_data` - `global_v`). The `example_state_data`
+# is computed in `optimize` of `SdcaModel` which is local `v`.
+# 
+# This part of data come from `SyncReplicaOptimizer`, an example of it is 
+# `mnist_replica.py`
+class SyncSdcaModel(SdcaModel):
+  def __init__(self,
+               opt,
+               replicas_to_aggregate,
+               total_num_replicas=None,
+               variable_averages=None,
+               variables_to_average=None,
+               use_locking=False,
+               name="sync_replicas"):
+    """Construct a sync_replicas optimizer.
+
+    Args:
+      opt: The actual optimizer that will be used to compute and apply the
+        gradients. Must be one of the Optimizer classes.
+      replicas_to_aggregate: number of replicas to aggregate for each variable
+        update.
+      total_num_replicas: Total number of tasks/workers/replicas, could be
+        different from replicas_to_aggregate.
+        If total_num_replicas > replicas_to_aggregate: it is backup_replicas +
+        replicas_to_aggregate.
+        If total_num_replicas < replicas_to_aggregate: Replicas compute
+        multiple batches per update to variables.
+      variable_averages: Optional `ExponentialMovingAverage` object, used to
+        maintain moving averages for the variables passed in
+        `variables_to_average`.
+      variables_to_average: a list of variables that need to be averaged. Only
+        needed if variable_averages is passed in.
+      use_locking: If True use locks for update operation.
+      name: string. Optional name of the returned operation.
+    """
+    if total_num_replicas is None:
+      total_num_replicas = replicas_to_aggregate
+
+    # super(SyncReplicasOptimizer, self).__init__(use_locking, name)
+    logging.info(
+        "SyncReplicasV2: replicas_to_aggregate=%s; total_num_replicas=%s",
+        replicas_to_aggregate, total_num_replicas)
+
+    self._name = name
+
+    self._opt = opt
+    self._replicas_to_aggregate = replicas_to_aggregate
+    self._gradients_applied = False
+    self._variable_averages = variable_averages
+    self._variables_to_average = variables_to_average
+    self._total_num_replicas   = total_num_replicas
+    self._tokens_per_step  = max(total_num_replicas, replicas_to_aggregate) 
+    self._global_step      = None
+    self._sync_token_queue = None
+
+    # The synchronization op will be executed in a queue runner which should
+    # only be executed by one of the replicas (usually the chief).
+    self._chief_queue_runner = None
+
+    # Remember which accumulator is on which device to set the initial step in
+    # the accumulator to be global step. This list contains list of the
+    # following format: (accumulator, device).
+    self._accumulator_list = []
+
+  def minimize(self, global_step=None, name=None):
+    """Apply gradients to variables.
+
+    This contains most of the synchronization implementation and also wraps the
+    apply_gradients() from the real optimizer.
+
+    Args:
+      grads_and_vars: List of (gradient, variable) pairs as returned by
+        compute_gradients().
+      global_step: Optional Variable to increment by one after the
+        variables have been updated.
+      name: Optional name for the returned operation.  Default to the
+        name passed to the Optimizer constructor.
+
+    Returns:
+      train_op: The op to dequeue a token so the replicas can exit this batch
+      and start the next one. This is executed by each replica.
+
+    Raises:
+      ValueError: If the grads_and_vars is empty.
+      ValueError: If global step is not provided, the staleness cannot be
+        checked.
+    """
+
+    if global_step is None:
+      raise ValueError("Global step is required to check staleness")
+
+    self._local_step = var_ops.Variable(
+        initial_value=0,
+        trainable=False,
+        collections=[ops.GraphKeys.LOCAL_VARIABLES],
+        dtype=global_step.dtype.base_dtype,
+        name="sync_rep_local_step")
+
+    # This step is used for `local_init_op` for supervisor to call.
+    self.local_step_init_op = state_ops.assign(self._local_step, global_step)
+    chief_init_ops = [self.local_step_init_op]
+    self.ready_for_local_init_op = var_ops.report_uninitialized_variables(
+        var_ops.global_variables())
+
+    local_train_op = self._opt.minimize(self._local_step, name, sync=True)
+
+    self._global_v = var_ops.Variable(
+        initial_value=array_ops.zeros(
+          [self._opt._example_ids_hashed.get_shape()[0], 4], dtypes.float32),
+        name='global_v')
+
+    with ops.control_dependencies([local_train_op]):
+      delta_example_state_data = self._opt._hashtable.lookup(self._opt._example_ids_hashed) - self._global_v
+
+    grads_and_vars = [(delta_example_state_data, self._global_v)]
+
+    self._global_step = global_step
+    train_ops = []
+    aggregated_grad = []
+    var_list = []
+
+    with ops.name_scope(None, self._name):
+      for grad, var in grads_and_vars:
+        var_list.append(var)
+        with ops.device(var.device):
+          if grad is None:
+            aggregated_grad.append(None)  # pass-through.
+            continue
+          elif isinstance(grad, ops.Tensor):
+            # get shared grad accumulator in the ps server
+            grad_accum = data_flow_ops.ConditionalAccumulator(
+                grad.dtype,
+                shape=var.get_shape(),
+                shared_name=var.name + "/grad_accum")
+
+            # Create an operation that push local `grad` to corresponding 
+            # `grad_accum` in ps server. 
+            train_ops.append(grad_accum.apply_grad(
+                grad, local_step=self._local_step))
+
+            # grad_accum.take_grad create a number of `_replicas_to_aggregate`
+            # **blocking** operations in parameter server. The operation will 
+            # return a grad tensor for each varaiable.  
+            aggregated_grad.append(grad_accum.take_grad(
+                  self._replicas_to_aggregate))
+          else:
+            if not isinstance(grad, ops.IndexedSlices):
+              raise ValueError("Unknown grad type!")
+            grad_accum = data_flow_ops.SparseConditionalAccumulator(
+                grad.dtype, shape=(), shared_name=var.name + "/grad_accum")
+            train_ops.append(grad_accum.apply_indexed_slices_grad(
+                grad, local_step=self._local_step))
+            aggregated_grad.append(grad_accum.take_indexed_slices_grad(
+                self._replicas_to_aggregate))
+
+          self._accumulator_list.append((grad_accum, var.device))
+
+      # updated grads from ps server and the corresponding var.
+      aggregated_grads_and_vars = zip(aggregated_grad, var_list)
+
+      # sync_op will be assigned to the same device as the global step.
+      with ops.device(global_step.device), ops.name_scope(""), ops.colocate_with(self._global_v):
+        # The minimize() function is still method in the base class where 
+        # apply_gradients is followed by compute_gradient. In sync_replicas,
+        # we add above code to push our local grads_and_vars and get
+        # `aggregated_grads_and_vars`. Then we apply `aggregated_grads_and_vars`
+        # to local gradient.
+        # This operation is only performed by chief worker as the chief qr will
+        # call sync_op and sync_op relie on update_op.
+        with ops.control_dependencies([aggregated_grad[0]]):
+          update_op = state_ops.assign_add(self._global_v, aggregated_grad[0])
+
+      # Create token queue.
+      with ops.device(global_step.device), ops.name_scope(""):
+        # get global_step in parameter server.
+        sync_token_queue = (
+            data_flow_ops.FIFOQueue(-1,
+                                    global_step.dtype.base_dtype,
+                                    shapes=(),
+                                    name="sync_token_q",
+                                    shared_name="sync_token_q"))
+        self._sync_token_queue = sync_token_queue
+
+        # dummy_queue is passed to the queue runner. Don't use the real queues
+        # because the queue runner doesn't automatically reopen it once it
+        # closed queues in PS devices.
+        dummy_queue = (
+            data_flow_ops.FIFOQueue(1,
+                                    types_pb2.DT_INT32,
+                                    shapes=(),
+                                    name="dummy_queue",
+                                    shared_name="dummy_queue"))
+
+      with ops.device(global_step.device), ops.name_scope(""):
+        # Replicas have to wait until they can get a token from the token queue.
+        # when all the gradients have been computed, ask for the next 
+        with ops.control_dependencies(train_ops):
+          # in `local_train_op`, the v is updated locally. We pull `global_v` to it so
+          # that when global_v is updated (by only chief worker), each worker will get
+          # the aggregated v.
+          update_v_op = self._opt._hashtable.insert(self._opt._example_ids_hashed, internal_convert_to_tensor(self._global_v))
+          with ops.control_dependencies([update_v_op]):
+            token = sync_token_queue.dequeue()
+
+        train_op = state_ops.assign(self._local_step, token)
+
+        with ops.control_dependencies([update_op]):
+          # Sync_op needs to insert tokens to the token queue at the end of the
+          # step so the replicas can fetch them to start the next step.
+          update_global_step_op = state_ops.assign_add(global_step, 1)
+          with ops.control_dependencies([update_global_step_op]):
+            tokens = array_ops.fill([self._tokens_per_step], global_step)
+          sync_op = sync_token_queue.enqueue_many((tokens,))
+
+        if self._variable_averages is not None:
+          with ops.control_dependencies([sync_op]), ops.name_scope(""):
+            sync_op = self._variable_averages.apply(
+                self._variables_to_average)
+
+        # The enqueue operation for dummy_queue is actually not for dummy queue
+        # but for sync_token_queue. So no matter how may times we have enqueued,
+        # the dummy_queue is always empty. We are trying to enqueue tokens for
+        # sync_token_queue.
+        self._chief_queue_runner = queue_runner.QueueRunner(dummy_queue,
+                                                            [sync_op])
+
+      # Set all the accumulators to same global_step.
+      for accum, dev in self._accumulator_list:
+        with ops.device(dev):
+          chief_init_ops.append(
+              accum.set_global_step(
+                  global_step, name="SetGlobalStep"))
+      self.chief_init_op = control_flow_ops.group(*(chief_init_ops))
+      self._gradients_applied = True
+
+      return train_op
+  
+  def update_weights(self, train_op):
+    return self._opt.update_weights(train_op)
+
+  def get_init_tokens_op(self, num_tokens=-1):
+    """Returns the op to fill the sync_token_queue with the tokens.
+
+    This is supposed to be executed in the beginning of the chief/sync thread
+    so that even if the total_num_replicas is less than replicas_to_aggregate,
+    the model can still proceed as the replicas can compute multiple steps per
+    variable update. Make sure:
+    `num_tokens >= replicas_to_aggregate - total_num_replicas`.
+
+    Args:
+      num_tokens: Number of tokens to add to the queue.
+
+    Returns:
+      An op for the chief/sync replica to fill the token queue.
+
+    Raises:
+      ValueError: If this is called before apply_gradients().
+      ValueError: If num_tokens are smaller than replicas_to_aggregate -
+        total_num_replicas.
+    """
+    if self._gradients_applied is False:
+      raise ValueError(
+          "get_init_tokens_op() should be called after apply_gradients().")
+
+    tokens_needed = self._replicas_to_aggregate - self._total_num_replicas
+    if num_tokens == -1:
+      num_tokens = self._replicas_to_aggregate
+    elif num_tokens < tokens_needed:
+      raise ValueError(
+          "Too few tokens to finish the first step: %d (given) vs %d (needed)" %
+          (num_tokens, tokens_needed))
+
+    if num_tokens > 0:
+      with ops.device(self._global_step.device), ops.name_scope(""):
+        tokens = array_ops.fill([num_tokens], self._global_step)
+        init_tokens = self._sync_token_queue.enqueue_many((tokens,))
+    else:
+      init_tokens = control_flow_ops.no_op(name="no_init_tokens")
+
+    return init_tokens

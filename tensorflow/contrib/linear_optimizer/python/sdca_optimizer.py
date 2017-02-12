@@ -22,6 +22,7 @@ from tensorflow.contrib.linear_optimizer.python.ops.sparse_feature_column import
 from tensorflow.python.ops import array_ops
 from tensorflow.python.ops import math_ops
 
+from tensorflow.python.framework import ops
 
 # TODO(sibyl-vie3Poto, sibyl-Aix6ihai): Add proper testing to this wrapper once the API is
 # stable.
@@ -68,13 +69,20 @@ class SDCAOptimizer(object):
                num_table_shards=None,
                symmetric_l1_regularization=0.0,
                symmetric_l2_regularization=1.0,
-               dual_method=False):
+               dual_method=False,
+               distributed_config=None,
+               chief_hook=None):
     self._example_id_column = example_id_column
     self._num_loss_partitions = num_loss_partitions
     self._num_table_shards = num_table_shards
     self._symmetric_l1_regularization = symmetric_l1_regularization
     self._symmetric_l2_regularization = symmetric_l2_regularization
     self._dual_method = dual_method
+
+    self._chief_hook = chief_hook
+
+    # if `distributed_config` is not None, then it sjpi;d an instance of RunConfig
+    self._distributed_config = distributed_config
 
   def get_name(self):
     return 'SDCAOptimizer'
@@ -83,15 +91,7 @@ class SDCAOptimizer(object):
                      weight_column_name, loss_type, features, targets,
                      global_step):
     """Returns the training operation of an SdcaModel optimizer."""
-    
-    # The input `features` maps FeatureColumn instance to the
-    # corresponding tensor. 
-
-    # Unlike dense features, which is easy to represent, the sparse features
-    # have many forms (_BucketizedColumn, _SparseColumn,...). In order to deal
-    # with these sparse columns uniformly, a class `SparseFeatureColumn` is
-    # defined to represent one feature group.
-    
+        
     def _tensor_to_sparse_feature_column(dense_tensor):
       """Returns SparseFeatureColumn for the input dense_tensor."""
       ignore_value = 0.0
@@ -213,4 +213,36 @@ class SDCAOptimizer(object):
             loss_type=loss_type,
             dual_method=self._dual_method))
     train_op = sdca_model.minimize(global_step=global_step)
+
+    if self._distributed_config:
+      # The number of workers is the number of tasks in `master` and `worker`.
+      num_workers = self._distributed_config._cluster_spec.num_tasks('master') 
+                  + self._distributed_config._cluster_spec.num_tasks('worker')
+      is_chief = self._distributed_config.is_chief
+
+      sdca_model = sdca_ops.SyncSdcaModel(
+        opt=sdca_model, 
+        replicas_to_aggregate=num_workers,
+        name="sdca_model_sync_replicas")
+
+    train_op = sdca_model.minimize(global_step=global_step)
+
+    if self._distributed_config:
+      if is_chief:
+        local_init_op = sdca_model.chief_init_op
+        ops.add_to_collection(ops.GraphKeys.QUEUE_RUNNERS, sdca_model._chief_queue_runner)
+      else:
+        local_init_op = sdca_model.local_step_init_op
+
+      from tensorflow.python.training import monitored_session
+      scaffold = monitored_session.Scaffold(
+                   ready_for_local_init_op=sdca_model.ready_for_local_init_op,
+                   local_init_op=local_init_op)
+
+      self._scaffold = scaffold
+
+      self._sync_init_op = sdca_model.get_init_tokens_op()
+    else:
+      self._scaffold = None
+
     return sdca_model, train_op

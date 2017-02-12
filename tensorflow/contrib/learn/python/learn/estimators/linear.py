@@ -240,14 +240,16 @@ def sdca_model_fn(features, labels, mode, params):
       update_weights_hook.set_parameters(sdca_model, train_op)
     return train_op
 
-  return head.head_ops(features, labels, mode, _train_op_fn, logits)
+  model_fn_ops = head.head_ops(features, labels, mode, _train_op_fn, logits)
+  if optimizer._distributed_config:
+    model_fn_ops._replace(training_scaffold=optimizer._scaffold)
+  return model_fn_ops
 
 
 # Ensures consistency with LinearComposableModel.
 def _get_default_optimizer(feature_columns):
   learning_rate = min(_LEARNING_RATE, 1.0 / math.sqrt(len(feature_columns)))
   return train.FtrlOptimizer(learning_rate=learning_rate)
-
 
 class _SdcaUpdateWeightsHook(session_run_hook.SessionRunHook):
   """SessionRunHook to update and shrink SDCA model weights."""
@@ -265,6 +267,19 @@ class _SdcaUpdateWeightsHook(session_run_hook.SessionRunHook):
     The op is implicitly added to the default graph.
     """
     self._update_op = self._sdca_model.update_weights(self._train_op)
+
+  def after_create_session(self, session):
+    """For distributed computing, enqueue tokens add sync_init_op.
+    
+    For distributed SDCA, enqueue tokens before
+    """
+    if self._sync_init_op:
+      session.run(self._sync_init_op)
+
+  def set_parameters(self, sdca_model, train_op, sync=False):
+    self._sdca_model = sdca_model
+    self._train_op = train_op
+    self._sync_init_op = sdca_model.get_init_tokens_op() if sync else None
 
   def before_run(self, run_context):
     """Return the update_weights op so that it is executed during this run."""
